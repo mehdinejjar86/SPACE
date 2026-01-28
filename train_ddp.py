@@ -13,13 +13,14 @@ import random
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
@@ -468,7 +469,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
         optimizer.zero_grad()
 
         amp_dtype = torch.bfloat16 if config.train.amp_dtype == "bfloat16" else torch.float16
-        with autocast(enabled=config.train.use_amp, dtype=amp_dtype):
+        with amp.autocast(device_type='cuda', enabled=config.train.use_amp, dtype=amp_dtype):
             pred_rgb = model(input_frames, input_times, coords)
 
             # Compute loss
@@ -941,6 +942,20 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, metrics, config,
 def main_worker(rank: int, world_size: int, args):
     """Main training worker for each GPU."""
 
+    # Silence torchvision pretrained/weights deprecation warnings from third-party libs (e.g. LPIPS).
+    warnings.filterwarnings(
+        "ignore",
+        message="The parameter 'pretrained' is deprecated since 0.13",
+        category=UserWarning,
+        module=r"torchvision\.models\._utils",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="Arguments other than a weight enum or `None` for 'weights' are deprecated",
+        category=UserWarning,
+        module=r"torchvision\.models\._utils",
+    )
+
     # Setup DDP
     if world_size > 1:
         setup_ddp(rank, world_size)
@@ -1094,7 +1109,7 @@ def main_worker(rank: int, world_size: int, args):
     else:
         scheduler = None
 
-    scaler = GradScaler(enabled=config.train.use_amp)
+    scaler = amp.GradScaler('cuda', enabled=config.train.use_amp)
 
     # Resume from checkpoint
     start_epoch = 0

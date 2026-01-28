@@ -8,11 +8,12 @@ import argparse
 import random
 from pathlib import Path
 from datetime import datetime
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -172,7 +173,7 @@ def sample_coordinates(target_frame: torch.Tensor,
 def train_epoch(model: SPACE,
                 dataloader,
                 optimizer,
-                scaler: GradScaler,
+                scaler: amp.GradScaler,
                 criterion: SPACELoss,
                 config,
                 epoch: int,
@@ -209,7 +210,7 @@ def train_epoch(model: SPACE,
         optimizer.zero_grad()
 
         amp_dtype = torch.bfloat16 if config.train.amp_dtype == "bfloat16" else torch.float16
-        with autocast(enabled=config.train.use_amp, dtype=amp_dtype):
+        with amp.autocast(device_type='cuda', enabled=config.train.use_amp, dtype=amp_dtype):
             pred_rgb = model(input_frames, input_times, coords)
             # Use SPACELoss (only charbonnier for coordinate sampling)
             losses = criterion(pred_rgb, target_rgb, compute_all=False)
@@ -251,7 +252,7 @@ def train_epoch(model: SPACE,
 def train_epoch_advanced(model: SPACE,
                          dataloader,
                          optimizer,
-                         scaler: GradScaler,
+                         scaler: amp.GradScaler,
                          criterion: AdvancedSPACELoss,
                          config,
                          epoch: int,
@@ -298,7 +299,7 @@ def train_epoch_advanced(model: SPACE,
         optimizer.zero_grad()
 
         amp_dtype = torch.bfloat16 if config.train.amp_dtype == "bfloat16" else torch.float16
-        with autocast(enabled=config.train.use_amp, dtype=amp_dtype):
+        with amp.autocast(device_type='cuda', enabled=config.train.use_amp, dtype=amp_dtype):
             # Forward pass
             pred_rgb = model(input_frames, input_times, coords)
 
@@ -450,7 +451,7 @@ def validate(model: SPACE,
 def save_checkpoint(model: SPACE,
                     optimizer,
                     scheduler,
-                    scaler: GradScaler,
+                    scaler: amp.GradScaler,
                     epoch: int,
                     metrics: dict,
                     config,
@@ -477,6 +478,20 @@ def save_checkpoint(model: SPACE,
 
 
 def main():
+    # Silence torchvision pretrained/weights deprecation warnings from third-party libs (e.g. LPIPS).
+    warnings.filterwarnings(
+        "ignore",
+        message="The parameter 'pretrained' is deprecated since 0.13",
+        category=UserWarning,
+        module=r"torchvision\.models\._utils",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="Arguments other than a weight enum or `None` for 'weights' are deprecated",
+        category=UserWarning,
+        module=r"torchvision\.models\._utils",
+    )
+
     parser = argparse.ArgumentParser(description="Train SPACE model")
     parser.add_argument('--config', type=str, default=None, help="Path to config file")
     parser.add_argument('--fast', action='store_true', help="Use fast/tiny config for testing")
@@ -593,7 +608,7 @@ def main():
         scheduler = None
 
     # Mixed precision scaler
-    scaler = GradScaler(enabled=config.train.use_amp)
+    scaler = amp.GradScaler('cuda', enabled=config.train.use_amp)
 
     # Resume from checkpoint
     start_epoch = 0
