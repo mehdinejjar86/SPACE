@@ -13,7 +13,7 @@ from .aggregator_x import TemporalAggregatorX
 from .decoder_x import HybridDecoder, UpsampleDecoder
 from .bias_generator import BiasGenerator
 from .refinement import RefinementModule
-from .nafnet_decoder import NAFNetDecoder
+from .nafnet_decoder import NAFNetDecoder, HybridNAFNetSIREN
 
 
 class SPACE(nn.Module):
@@ -79,7 +79,12 @@ class SPACE(nn.Module):
                  use_nafnet_decoder: bool = False,
                  nafnet_hidden_dim: int = 64,
                  nafnet_num_blocks: List[int] = None,
-                 nafnet_use_modulation: bool = True):
+                 nafnet_use_modulation: bool = True,
+
+                 # Hybrid NAFNet + SIREN decoder (recommended default)
+                 use_hybrid_decoder: bool = True,
+                 hybrid_siren_hidden_dim: int = 64,
+                 hybrid_siren_layers: int = 3):
         """
         Args:
             encoder_dims: ConvNeXt channel dims per stage [64, 128, 256, 512]
@@ -99,6 +104,9 @@ class SPACE(nn.Module):
             nafnet_hidden_dim: NAFNet decoder hidden dimension
             nafnet_num_blocks: NAFNet blocks per level [2, 2, 4, 4]
             nafnet_use_modulation: Apply scene/time-conditioned modulation in NAFNet
+            use_hybrid_decoder: Use Hybrid NAFNet+SIREN decoder (recommended default)
+            hybrid_siren_hidden_dim: SIREN hidden dimension in hybrid decoder
+            hybrid_siren_layers: SIREN depth in hybrid decoder
         """
         super().__init__()
 
@@ -116,6 +124,7 @@ class SPACE(nn.Module):
         self.use_refinement = use_refinement
         self.use_nafnet_decoder = use_nafnet_decoder
         self.nafnet_use_modulation = nafnet_use_modulation
+        self.use_hybrid_decoder = use_hybrid_decoder
 
         # 1. Multi-scale Frame Encoder (ConvNeXt)
         self.encoder = FrameEncoderX(
@@ -165,12 +174,23 @@ class SPACE(nn.Module):
             )
 
         # 7. NAFNet-style Decoder (optional, alternative to fast_decoder)
-        if use_nafnet_decoder:
+        if use_nafnet_decoder and not use_hybrid_decoder:
             self.nafnet_decoder = NAFNetDecoder(
                 feature_dims=encoder_dims,
                 hidden_dim=nafnet_hidden_dim,
                 num_blocks=nafnet_num_blocks,
                 mod_dim=latent_dim if nafnet_use_modulation else None,
+            )
+
+        # 8. Hybrid NAFNet + SIREN Decoder (recommended default)
+        if use_hybrid_decoder:
+            self.hybrid_decoder = HybridNAFNetSIREN(
+                feature_dims=encoder_dims,
+                hidden_dim=nafnet_hidden_dim,
+                num_blocks=nafnet_num_blocks,
+                latent_dim=latent_dim,
+                siren_hidden_dim=hybrid_siren_hidden_dim,
+                siren_num_layers=hybrid_siren_layers,
             )
 
     def encode(self,
@@ -248,12 +268,36 @@ class SPACE(nn.Module):
         device = encoding['scene_code'].device
 
         if mode == 'auto':
-            if self.use_nafnet_decoder:
+            if self.use_hybrid_decoder:
+                mode = 'hybrid'
+            elif self.use_nafnet_decoder:
                 mode = 'nafnet'
             elif H * W > 256 * 256:
                 mode = 'fast'
             else:
                 mode = 'hq'
+
+        if mode == 'hybrid' and self.use_hybrid_decoder:
+            # Create coordinate grid
+            y = torch.linspace(-1, 1, H, device=device)
+            x = torch.linspace(-1, 1, W, device=device)
+            yy, xx = torch.meshgrid(y, x, indexing='ij')
+            query_time = self._normalize_target_time(target_time, B, device)
+            t_val = query_time.squeeze(1).view(B, 1).expand(B, H * W)
+            coords = torch.stack([
+                xx.flatten().unsqueeze(0).expand(B, -1),
+                yy.flatten().unsqueeze(0).expand(B, -1),
+                t_val,
+            ], dim=-1)
+            pred = self.hybrid_decoder(
+                encoding['feature_grids'],
+                encoding['scene_code'],
+                coords=coords,
+                biases=encoding['biases'],
+            )
+            if pred.shape[2:] != (H, W):
+                pred = F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=True)
+            return pred
 
         if mode == 'nafnet' and self.use_nafnet_decoder:
             pred = self.nafnet_decoder(encoding['feature_grids'], encoding['scene_code'])
@@ -363,14 +407,18 @@ class SPACE(nn.Module):
         H, W = frames.shape[3], frames.shape[4]
 
         if mode == 'auto':
-            # Prefer NAFNet if available; otherwise fast for large, HQ for small
-            if self.use_nafnet_decoder:
+            # Prefer hybrid > NAFNet > fast > HQ
+            if self.use_hybrid_decoder:
+                mode = 'hybrid'
+            elif self.use_nafnet_decoder:
                 mode = 'nafnet'
             elif H * W > 256 * 256:
                 mode = 'fast'
             else:
                 mode = 'hq'
 
+        if mode == 'hybrid' and self.use_hybrid_decoder:
+            return self._render_hybrid(frames, frame_times, target_time)
         if mode == 'nafnet' and self.use_nafnet_decoder:
             return self._render_nafnet(frames, frame_times, target_time)
         if mode == 'fast' and self.use_fast_decoder:
@@ -413,6 +461,50 @@ class SPACE(nn.Module):
         rgb = self.decode_coords(coords, encoding)
 
         return rgb.view(B, H, W, 3).permute(0, 3, 1, 2)
+
+    def _render_hybrid(self,
+                       frames: torch.Tensor,
+                       frame_times: torch.Tensor,
+                       target_time: float) -> torch.Tensor:
+        """Hybrid rendering using NAFNet + SIREN guidance."""
+        if not self.use_hybrid_decoder:
+            return self._render_nafnet(frames, frame_times, target_time)
+
+        B = frames.shape[0]
+        H, W = frames.shape[3], frames.shape[4]
+        device = frames.device
+
+        if isinstance(target_time, (int, float)):
+            query_time = torch.full((B, 1), target_time, device=device)
+        else:
+            t = target_time.to(device)
+            if t.dim() == 2:
+                t = t.squeeze(1)
+            query_time = t.unsqueeze(1)
+
+        encoding = self.encode(frames, frame_times, query_time)
+
+        # Create coordinate grid with time
+        y = torch.linspace(-1, 1, H, device=device)
+        x = torch.linspace(-1, 1, W, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        t_val = query_time.squeeze(1).view(B, 1).expand(B, H * W)
+        coords = torch.stack([
+            xx.flatten().unsqueeze(0).expand(B, -1),
+            yy.flatten().unsqueeze(0).expand(B, -1),
+            t_val,
+        ], dim=-1)  # [B, H*W, 3]
+
+        pred = self.hybrid_decoder(
+            encoding['feature_grids'],
+            encoding['scene_code'],
+            coords=coords,
+            biases=encoding['biases'],
+        )
+
+        if pred.shape[2:] != (H, W):
+            pred = F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=True)
+        return pred
 
     def _render_nafnet(self,
                        frames: torch.Tensor,
@@ -575,8 +667,10 @@ class SPACE(nn.Module):
         }
         if self.use_fast_decoder:
             counts['fast_decoder'] = sum(p.numel() for p in self.fast_decoder.parameters())
-        if self.use_nafnet_decoder:
+        if self.use_nafnet_decoder and not self.use_hybrid_decoder:
             counts['nafnet_decoder'] = sum(p.numel() for p in self.nafnet_decoder.parameters())
+        if self.use_hybrid_decoder:
+            counts['hybrid_decoder'] = sum(p.numel() for p in self.hybrid_decoder.parameters())
         if self.use_refinement:
             counts['refinement'] = sum(p.numel() for p in self.refinement.parameters())
         counts['total'] = sum(counts.values())
@@ -604,7 +698,10 @@ def build_space(config: str = 'base', **overrides) -> SPACE:
             'hidden_dim': 128,
             'num_siren_layers': 3,
             'use_fast_decoder': False,
-            'use_nafnet_decoder': True,
+            'use_nafnet_decoder': False,
+            'use_hybrid_decoder': True,
+            'hybrid_siren_hidden_dim': 64,
+            'hybrid_siren_layers': 3,
         },
         'base': {
             'encoder_dims': [64, 128, 256, 512],
@@ -613,7 +710,10 @@ def build_space(config: str = 'base', **overrides) -> SPACE:
             'hidden_dim': 256,
             'num_siren_layers': 4,
             'use_fast_decoder': False,
-            'use_nafnet_decoder': True,
+            'use_nafnet_decoder': False,
+            'use_hybrid_decoder': True,
+            'hybrid_siren_hidden_dim': 64,
+            'hybrid_siren_layers': 3,
         },
         'large': {
             'encoder_dims': [96, 192, 384, 768],
@@ -622,7 +722,10 @@ def build_space(config: str = 'base', **overrides) -> SPACE:
             'hidden_dim': 384,
             'num_siren_layers': 5,
             'use_fast_decoder': False,
-            'use_nafnet_decoder': True,
+            'use_nafnet_decoder': False,
+            'use_hybrid_decoder': True,
+            'hybrid_siren_hidden_dim': 96,
+            'hybrid_siren_layers': 4,
         },
     }
 

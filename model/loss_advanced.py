@@ -786,3 +786,339 @@ class AdvancedSPACELoss(nn.Module):
             'sigmas': self.uncertainty.get_sigmas(),
             'log_vars': {name: p.item() for name, p in self.uncertainty.log_vars.items()}
         }
+
+
+# =============================================================================
+# Full-Frame Anchor Distillation
+# =============================================================================
+
+class FullFrameAnchorDistillationLoss(nn.Module):
+    """
+    Full-frame anchor distillation for hybrid decoder training.
+
+    At anchor timestamps, the model should perfectly reconstruct the input frames.
+    Unlike coordinate-based distillation, this computes loss on full frames.
+    """
+
+    def __init__(self,
+                 use_msssim: bool = True,
+                 use_lpips: bool = False,
+                 lpips_net: str = 'alex',
+                 anchor_indices: Union[str, List[int]] = 'all'):
+        """
+        Args:
+            use_msssim: Use MS-SSIM loss for anchor distillation
+            use_lpips: Use LPIPS loss for anchor distillation
+            lpips_net: LPIPS backbone
+            anchor_indices: 'all' or list like [0, -1] for first/last
+        """
+        super().__init__()
+        self.anchor_indices = anchor_indices
+
+        self.charbonnier = CharbonnierLoss(eps=1e-3)
+
+        if use_msssim:
+            self.msssim = MultiScaleSSIMLoss(levels=3)  # Fewer levels for speed
+        else:
+            self.msssim = None
+
+        if use_lpips:
+            self.lpips = LPIPSLoss(net=lpips_net)
+        else:
+            self.lpips = None
+
+    def forward(self,
+                model: nn.Module,
+                input_frames: torch.Tensor,
+                input_times: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute full-frame anchor distillation.
+
+        Args:
+            model: SPACE model with render_frame method
+            input_frames: [B, N, 3, H, W]
+            input_times: [B, N]
+
+        Returns:
+            Dict with 'anchor_distill' total and per-anchor losses
+        """
+        B, N, C, H, W = input_frames.shape
+        device = input_frames.device
+
+        # Determine which anchors to use
+        if self.anchor_indices == 'all':
+            indices = list(range(N))
+        elif self.anchor_indices == 'first_last':
+            indices = [0, N - 1]
+        else:
+            indices = [i if i >= 0 else N + i for i in self.anchor_indices]
+
+        losses = {}
+        total = torch.tensor(0.0, device=device)
+
+        for idx in indices:
+            # Get anchor frame and time
+            anchor_frame = input_frames[:, idx]  # [B, 3, H, W]
+            anchor_time = input_times[:, idx]    # [B]
+
+            # Render at anchor time (should match anchor frame exactly)
+            pred_frame = model.render_frame(input_frames, input_times, anchor_time)
+
+            # Compute losses
+            loss_char = self.charbonnier(pred_frame, anchor_frame)
+            anchor_loss = loss_char
+
+            if self.msssim is not None:
+                loss_msssim = self.msssim(pred_frame, anchor_frame)
+                anchor_loss = anchor_loss + 0.5 * loss_msssim
+
+            if self.lpips is not None:
+                loss_lpips = self.lpips(pred_frame, anchor_frame)
+                anchor_loss = anchor_loss + 0.1 * loss_lpips
+
+            losses[f'anchor_{idx}'] = anchor_loss
+            total = total + anchor_loss
+
+        losses['anchor_distill'] = total / len(indices)
+        return losses
+
+
+# =============================================================================
+# Hybrid Decoder Loss
+# =============================================================================
+
+class HybridLoss(nn.Module):
+    """
+    Loss function optimized for hybrid NAFNet+SIREN decoder.
+
+    Features:
+    - Full-frame losses (MS-SSIM, LPIPS, Gradient, Frequency)
+    - Full-frame anchor distillation
+    - Optional coordinate-sampled loss for SIREN guidance
+    - Uncertainty weighting
+    - Progressive curriculum
+    """
+
+    def __init__(self,
+                 # Loss components
+                 use_charbonnier: bool = True,
+                 use_msssim: bool = True,
+                 use_lpips: bool = True,
+                 use_gradient: bool = True,
+                 use_frequency: bool = True,
+
+                 # Anchor distillation
+                 use_anchor_distillation: bool = True,
+                 anchor_distill_weight: float = 0.3,
+                 anchor_indices: Union[str, List[int]] = 'first_last',
+
+                 # Coordinate sampling (for SIREN)
+                 use_coord_loss: bool = True,
+                 coord_samples: int = 1024,
+
+                 # Weighting
+                 use_uncertainty_weighting: bool = True,
+                 fixed_weights: Dict[str, float] = None,
+
+                 # Progressive
+                 use_progressive: bool = True,
+
+                 # Specific configs
+                 charbonnier_eps: float = 1e-3,
+                 lpips_net: str = 'alex'):
+        """
+        Initialize hybrid loss.
+
+        Args:
+            use_*: Enable/disable specific losses
+            use_anchor_distillation: Enable anchor frame distillation
+            anchor_distill_weight: Weight for anchor loss
+            anchor_indices: Which anchors to use
+            use_coord_loss: Also compute coordinate-sampled loss
+            coord_samples: Number of coordinates to sample
+            use_uncertainty_weighting: Learnable weights
+            use_progressive: Progressive curriculum
+        """
+        super().__init__()
+
+        self.use_anchor_distillation = use_anchor_distillation
+        self.anchor_distill_weight = anchor_distill_weight
+        self.use_coord_loss = use_coord_loss
+        self.coord_samples = coord_samples
+        self.use_uncertainty_weighting = use_uncertainty_weighting
+        self.use_progressive = use_progressive
+
+        # Initialize loss components
+        loss_names = []
+        self.enabled_losses = {}
+
+        if use_charbonnier:
+            self.charbonnier = CharbonnierLoss(eps=charbonnier_eps)
+            loss_names.append('charbonnier')
+            self.enabled_losses['charbonnier'] = True
+
+        if use_msssim:
+            self.msssim = MultiScaleSSIMLoss(levels=5)
+            loss_names.append('msssim')
+            self.enabled_losses['msssim'] = True
+
+        if use_lpips:
+            self.lpips = LPIPSLoss(net=lpips_net)
+            loss_names.append('lpips')
+            self.enabled_losses['lpips'] = True
+
+        if use_gradient:
+            self.gradient = GradientLoss()
+            loss_names.append('gradient')
+            self.enabled_losses['gradient'] = True
+
+        if use_frequency:
+            self.frequency = FrequencyLoss()
+            loss_names.append('frequency')
+            self.enabled_losses['frequency'] = True
+
+        if use_coord_loss:
+            self.coord_charbonnier = CharbonnierLoss(eps=charbonnier_eps)
+            loss_names.append('coord_loss')
+            self.enabled_losses['coord_loss'] = True
+
+        self.loss_names = loss_names
+        self.active_losses = set(loss_names)
+
+        # Uncertainty weighting
+        if use_uncertainty_weighting:
+            init_log_vars = {
+                'charbonnier': 0.0,
+                'msssim': 0.5,
+                'lpips': 1.0,
+                'gradient': 1.5,
+                'frequency': 2.0,
+                'coord_loss': 0.5,
+            }
+            self.uncertainty = UncertaintyWeighting(loss_names, init_log_vars)
+        else:
+            if fixed_weights is None:
+                fixed_weights = {
+                    'charbonnier': 1.0,
+                    'msssim': 0.5,
+                    'lpips': 0.1,
+                    'gradient': 0.1,
+                    'frequency': 0.1,
+                    'coord_loss': 0.5,
+                }
+            self.fixed_weights = fixed_weights
+
+        # Anchor distillation
+        if use_anchor_distillation:
+            self.anchor_distill = FullFrameAnchorDistillationLoss(
+                use_msssim=True,
+                use_lpips=False,
+                anchor_indices=anchor_indices,
+            )
+
+        # Progressive scheduler
+        if use_progressive:
+            self.progressive_scheduler = ProgressiveLossScheduler({
+                0: ['charbonnier', 'coord_loss'],
+                5: ['charbonnier', 'coord_loss', 'msssim'],
+                15: ['charbonnier', 'coord_loss', 'msssim', 'gradient'],
+                30: ['charbonnier', 'coord_loss', 'msssim', 'gradient', 'lpips'],
+                50: ['charbonnier', 'coord_loss', 'msssim', 'gradient', 'lpips', 'frequency'],
+            })
+
+    def set_active_losses(self, active: List[str]):
+        """Set which losses are currently active."""
+        self.active_losses = set(active)
+
+    def update_for_epoch(self, epoch: int):
+        """Update active losses based on epoch."""
+        if self.use_progressive:
+            active = self.progressive_scheduler.get_active_losses(epoch)
+            self.set_active_losses(active)
+            return active
+        return list(self.active_losses)
+
+    def forward(self,
+                pred_full: torch.Tensor,
+                target_full: torch.Tensor,
+                pred_coords: torch.Tensor = None,
+                target_coords: torch.Tensor = None,
+                model: nn.Module = None,
+                input_frames: torch.Tensor = None,
+                input_times: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+        """
+        Compute hybrid loss.
+
+        Args:
+            pred_full: [B, 3, H, W] full-frame prediction
+            target_full: [B, 3, H, W] full-frame target
+            pred_coords: [B, Q, 3] coordinate predictions (optional)
+            target_coords: [B, Q, 3] coordinate targets (optional)
+            model: SPACE model (for anchor distillation)
+            input_frames: [B, N, 3, H, W] (for anchor distillation)
+            input_times: [B, N] (for anchor distillation)
+
+        Returns:
+            Dict with 'total' and individual losses
+        """
+        losses = {}
+        raw_losses = {}
+
+        # 1. Full-frame losses
+        if hasattr(self, 'charbonnier') and 'charbonnier' in self.active_losses:
+            raw_losses['charbonnier'] = self.charbonnier(pred_full, target_full)
+
+        if hasattr(self, 'msssim') and 'msssim' in self.active_losses:
+            raw_losses['msssim'] = self.msssim(pred_full, target_full)
+
+        if hasattr(self, 'lpips') and 'lpips' in self.active_losses:
+            raw_losses['lpips'] = self.lpips(pred_full, target_full)
+
+        if hasattr(self, 'gradient') and 'gradient' in self.active_losses:
+            raw_losses['gradient'] = self.gradient(pred_full, target_full)
+
+        if hasattr(self, 'frequency') and 'frequency' in self.active_losses:
+            raw_losses['frequency'] = self.frequency(pred_full, target_full)
+
+        # 2. Coordinate-sampled loss (for SIREN guidance)
+        if (self.use_coord_loss and
+            'coord_loss' in self.active_losses and
+            pred_coords is not None and
+            target_coords is not None):
+            raw_losses['coord_loss'] = self.coord_charbonnier(pred_coords, target_coords)
+
+        # Store raw losses
+        losses.update(raw_losses)
+
+        # 3. Apply weighting
+        if self.use_uncertainty_weighting and hasattr(self, 'uncertainty'):
+            total, weighted_losses, weights = self.uncertainty(raw_losses)
+            for name, val in weighted_losses.items():
+                losses[f'{name}_weighted'] = val
+            losses['_weights'] = weights
+        else:
+            total = torch.tensor(0.0, device=pred_full.device)
+            for name, loss in raw_losses.items():
+                weight = self.fixed_weights.get(name, 1.0)
+                total = total + weight * loss
+
+        # 4. Anchor distillation (not uncertainty weighted)
+        if (self.use_anchor_distillation and
+            model is not None and
+            input_frames is not None):
+            anchor_losses = self.anchor_distill(model, input_frames, input_times)
+            losses['anchor_distill'] = anchor_losses['anchor_distill']
+            total = total + self.anchor_distill_weight * anchor_losses['anchor_distill']
+
+        losses['total'] = total
+        return losses
+
+    def get_uncertainty_stats(self) -> Dict[str, Dict[str, float]]:
+        """Get current uncertainty parameters for logging."""
+        if not self.use_uncertainty_weighting or not hasattr(self, 'uncertainty'):
+            return {}
+
+        return {
+            'weights': self.uncertainty.get_weights(),
+            'sigmas': self.uncertainty.get_sigmas(),
+        }

@@ -6,7 +6,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class LayerNorm2d(nn.Module):
@@ -207,7 +207,8 @@ class NAFNetDecoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
-                nn.init.zeros_(m.weight)
+                # Use xavier for proper FiLM modulation
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -466,3 +467,359 @@ class TemporalFusion(nn.Module):
         fused = self.norm(fused)
 
         return fused
+
+
+class SIRENGuidance(nn.Module):
+    """
+    Lightweight SIREN module that generates guidance signals for NAFNet.
+
+    Outputs:
+    - Attention map: Where to focus (spatial attention)
+    - Residual features: Fine details to add
+    """
+
+    def __init__(
+        self,
+        coord_dim: int = 3,
+        hidden_dim: int = 64,
+        feature_dim: int = 256,
+        num_layers: int = 3,
+        omega_0: float = 30.0,
+    ):
+        super().__init__()
+        import math
+
+        self.omega_0 = omega_0
+        self.num_layers = num_layers
+
+        # Fourier coordinate encoding
+        num_frequencies = 32
+        self.register_buffer(
+            'frequencies',
+            torch.randn(coord_dim, num_frequencies) * 10.0
+        )
+        self.coord_proj = nn.Linear(num_frequencies * 2, hidden_dim)
+
+        # Feature projection
+        self.feature_proj = nn.Linear(feature_dim, hidden_dim)
+
+        # SIREN layers
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            in_dim = hidden_dim * 2 if i == 0 else hidden_dim
+            out_dim = hidden_dim
+            self.layers.append(nn.Linear(in_dim, out_dim))
+
+        # Output heads
+        self.attention_head = nn.Linear(hidden_dim, 1)  # Spatial attention
+        self.residual_head = nn.Linear(hidden_dim, 3)   # RGB residual
+
+        self._init_weights()
+
+    def _init_weights(self):
+        import math
+        for i, layer in enumerate(self.layers):
+            if i == 0:
+                bound = 1.0 / layer.in_features
+            else:
+                bound = math.sqrt(6.0 / layer.in_features) / self.omega_0
+            nn.init.uniform_(layer.weight, -bound, bound)
+            nn.init.zeros_(layer.bias)
+
+        # Initialize outputs to near-zero for stable start
+        nn.init.zeros_(self.attention_head.weight)
+        nn.init.zeros_(self.attention_head.bias)
+        nn.init.zeros_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
+
+    def encode_coords(self, coords: torch.Tensor) -> torch.Tensor:
+        """Fourier encode coordinates."""
+        proj = coords @ self.frequencies
+        encoded = torch.cat([torch.sin(2 * 3.14159 * proj),
+                             torch.cos(2 * 3.14159 * proj)], dim=-1)
+        return self.coord_proj(encoded)
+
+    def forward(
+        self,
+        coords: torch.Tensor,
+        features: torch.Tensor,
+        scene_code: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            coords: [B, Q, 3] query coordinates (x, y, t)
+            features: [B, Q, feature_dim] sampled spatial features
+            scene_code: Optional [B, feature_dim] scene conditioning (unused, for API compat)
+
+        Returns:
+            attention: [B, Q, 1] attention weights
+            residual: [B, Q, 3] RGB residual
+        """
+        # Encode coordinates
+        coord_feat = self.encode_coords(coords)  # [B, Q, hidden_dim]
+
+        # Project features
+        feat_proj = self.feature_proj(features)  # [B, Q, hidden_dim]
+
+        # Concatenate
+        x = torch.cat([coord_feat, feat_proj], dim=-1)  # [B, Q, hidden_dim*2]
+
+        # SIREN layers (no external biases - keeps SIREN guidance independent)
+        for layer in self.layers:
+            x = layer(x)
+            x = torch.sin(self.omega_0 * x)
+
+        # Output heads
+        attention = torch.sigmoid(self.attention_head(x))  # [B, Q, 1]
+        residual = self.residual_head(x) * 0.1  # Small residual, [B, Q, 3]
+
+        return attention, residual
+
+
+class HybridNAFNetSIREN(nn.Module):
+    """
+    Hybrid decoder combining NAFNet (full-frame) with SIREN (coordinate-based guidance).
+
+    Architecture:
+        1. NAFNet produces full-frame base output and intermediate features
+        2. SIREN provides coordinate-aware guidance:
+           - Attention: Where NAFNet should focus
+           - Residual: Fine details to add
+        3. Final output = NAFNet_base * attention + SIREN_residual
+
+    Benefits:
+        - NAFNet: Fast, efficient, good at structure
+        - SIREN: Continuous, good at fine details, temporally consistent
+        - Hybrid: Best of both worlds
+    """
+
+    def __init__(
+        self,
+        feature_dims: List[int] = None,
+        hidden_dim: int = 64,
+        num_blocks: List[int] = None,
+        latent_dim: int = 256,
+        siren_hidden_dim: int = 64,
+        siren_num_layers: int = 3,
+        omega_0: float = 30.0,
+        dropout: float = 0.0,
+    ):
+        """
+        Args:
+            feature_dims: Encoder feature dimensions [64, 128, 256, 512]
+            hidden_dim: NAFNet hidden dimension
+            num_blocks: NAFNet blocks per level [2, 2, 4, 4]
+            latent_dim: Scene code dimension (for FiLM modulation)
+            siren_hidden_dim: SIREN hidden dimension
+            siren_num_layers: SIREN depth
+            omega_0: SIREN frequency scaling
+            dropout: Dropout rate
+        """
+        super().__init__()
+
+        if feature_dims is None:
+            feature_dims = [64, 128, 256, 512]
+        if num_blocks is None:
+            num_blocks = [2, 2, 4, 4]
+
+        self.feature_dims = feature_dims
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+
+        # NAFNet decoder (produces full-frame output + features)
+        self.nafnet = NAFNetDecoder(
+            feature_dims=feature_dims,
+            hidden_dim=hidden_dim,
+            num_blocks=num_blocks,
+            dropout=dropout,
+            mod_dim=latent_dim,
+        )
+
+        # Feature sampler for SIREN (samples from encoder features)
+        total_feat_dim = sum(feature_dims)
+        self.feat_projs = nn.ModuleList([
+            nn.Conv2d(dim, hidden_dim, 1) for dim in feature_dims
+        ])
+        self.feat_fusion = nn.Linear(hidden_dim * len(feature_dims), latent_dim)
+
+        # SIREN guidance module
+        self.siren_guidance = SIRENGuidance(
+            coord_dim=3,
+            hidden_dim=siren_hidden_dim,
+            feature_dim=latent_dim,
+            num_layers=siren_num_layers,
+            omega_0=omega_0,
+        )
+
+        # Learnable blend factor (starts favoring NAFNet)
+        self.blend_alpha = nn.Parameter(torch.tensor(0.1))
+
+    def sample_features(
+        self,
+        feature_grids: List[torch.Tensor],
+        coords: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Sample and fuse features from multi-scale grids at query coordinates.
+
+        Args:
+            feature_grids: List of [B, C_i, H_i, W_i]
+            coords: [B, Q, 3] query coordinates
+
+        Returns:
+            [B, Q, latent_dim] sampled features
+        """
+        B, Q, _ = coords.shape
+        xy = coords[:, :, :2]  # Spatial coords
+        grid = xy.view(B, Q, 1, 2)
+
+        sampled = []
+        for feat, proj in zip(feature_grids, self.feat_projs):
+            # Project features
+            feat_proj = proj(feat)  # [B, hidden_dim, H, W]
+            # Sample at coordinates
+            s = F.grid_sample(feat_proj, grid, mode='bilinear',
+                              padding_mode='border', align_corners=True)
+            s = s.squeeze(-1).permute(0, 2, 1)  # [B, Q, hidden_dim]
+            sampled.append(s)
+
+        # Concatenate and fuse
+        concat = torch.cat(sampled, dim=-1)  # [B, Q, hidden_dim * num_scales]
+        fused = self.feat_fusion(concat)  # [B, Q, latent_dim]
+
+        return fused
+
+    def forward(
+        self,
+        feature_grids: List[torch.Tensor],
+        scene_code: torch.Tensor,
+        coords: Optional[torch.Tensor] = None,
+        biases: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """
+        Hybrid forward pass.
+
+        Args:
+            feature_grids: List of [B, C_i, H_i, W_i] encoder features
+            scene_code: [B, latent_dim] scene/time conditioning
+            coords: Optional [B, Q, 3] query coordinates for SIREN guidance
+                    If None, creates a dense grid at output resolution
+            biases: Optional scene-level biases for SIREN
+
+        Returns:
+            [B, 3, H, W] RGB output
+        """
+        B = feature_grids[0].shape[0]
+        device = feature_grids[0].device
+
+        # 1. NAFNet: full-frame base output
+        nafnet_out = self.nafnet(feature_grids, scene_code)  # [B, 3, H_naf, W_naf]
+        H_naf, W_naf = nafnet_out.shape[2:]
+
+        # 2. Determine output spatial dimensions
+        if coords is None:
+            # Use NAFNet output size
+            H, W = H_naf, W_naf
+            y = torch.linspace(-1, 1, H, device=device)
+            x = torch.linspace(-1, 1, W, device=device)
+            yy, xx = torch.meshgrid(y, x, indexing='ij')
+            coords = torch.stack([
+                xx.flatten(),
+                yy.flatten(),
+                torch.zeros_like(xx.flatten()),  # t=0 placeholder
+            ], dim=-1).unsqueeze(0).expand(B, -1, -1)  # [B, H*W, 3]
+        else:
+            # Infer H, W from coords (assuming square grid or provided shape)
+            Q = coords.shape[1]
+            H = W = int(Q ** 0.5)
+            if H * W != Q:
+                # Non-square, try to infer from NAFNet output aspect ratio
+                aspect = W_naf / H_naf
+                H = int((Q / aspect) ** 0.5)
+                W = Q // H
+                if H * W != Q:
+                    # Fallback: just use NAFNet output size and sample
+                    H, W = H_naf, W_naf
+
+        # 3. Sample features at coordinates
+        sampled_feats = self.sample_features(feature_grids, coords)  # [B, Q, latent_dim]
+
+        # 4. SIREN guidance (uses features, not biases - keeps it independent)
+        attention, residual = self.siren_guidance(coords, sampled_feats)
+        # attention: [B, Q, 1], residual: [B, Q, 3]
+
+        Q = coords.shape[1]
+
+        # 5. Reshape attention and residual to spatial (if Q == H*W)
+        if Q == H * W:
+            attention_map = attention.view(B, H, W, 1).permute(0, 3, 1, 2)  # [B, 1, H, W]
+            residual_map = residual.view(B, H, W, 3).permute(0, 3, 1, 2)    # [B, 3, H, W]
+
+            # Resize NAFNet output if needed
+            if (H_naf, W_naf) != (H, W):
+                nafnet_out = F.interpolate(nafnet_out, size=(H, W), mode='bilinear', align_corners=True)
+
+            # 6. Blend: NAFNet modulated by attention + residual
+            alpha = torch.sigmoid(self.blend_alpha)
+            output = nafnet_out * (1 + alpha * (attention_map - 0.5)) + alpha * residual_map
+            output = output.clamp(0, 1)
+        else:
+            # coords don't form a regular grid - sample NAFNet at coords
+            xy = coords[:, :, :2]
+            grid = xy.view(B, Q, 1, 2)
+            nafnet_sampled = F.grid_sample(nafnet_out, grid, mode='bilinear',
+                                           padding_mode='border', align_corners=True)
+            nafnet_sampled = nafnet_sampled.squeeze(-1).permute(0, 2, 1)  # [B, Q, 3]
+
+            # Blend in coordinate space
+            alpha = torch.sigmoid(self.blend_alpha)
+            output_coords = nafnet_sampled * (1 + alpha * (attention - 0.5)) + alpha * residual
+            output_coords = output_coords.clamp(0, 1)
+
+            # Reshape to spatial (use NAFNet output size as fallback)
+            output = output_coords.view(B, H_naf, W_naf, 3).permute(0, 3, 1, 2)
+
+        return output
+
+    def forward_coords(
+        self,
+        feature_grids: List[torch.Tensor],
+        scene_code: torch.Tensor,
+        coords: torch.Tensor,
+        biases: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """
+        Coordinate-based forward for training with sampled coordinates.
+
+        Args:
+            feature_grids: List of [B, C_i, H_i, W_i]
+            scene_code: [B, latent_dim]
+            coords: [B, Q, 3] sampled coordinates
+            biases: Optional biases
+
+        Returns:
+            [B, Q, 3] RGB at queried coordinates
+        """
+        B, Q, _ = coords.shape
+        device = coords.device
+
+        # Get NAFNet full output
+        nafnet_out = self.nafnet(feature_grids, scene_code)  # [B, 3, H, W]
+
+        # Sample NAFNet output at coordinates
+        xy = coords[:, :, :2]
+        grid = xy.view(B, Q, 1, 2)
+        nafnet_sampled = F.grid_sample(nafnet_out, grid, mode='bilinear',
+                                       padding_mode='border', align_corners=True)
+        nafnet_sampled = nafnet_sampled.squeeze(-1).permute(0, 2, 1)  # [B, Q, 3]
+
+        # Sample features and get SIREN guidance
+        sampled_feats = self.sample_features(feature_grids, coords)
+        attention, residual = self.siren_guidance(coords, sampled_feats)
+
+        # Blend
+        alpha = torch.sigmoid(self.blend_alpha)
+        output = nafnet_sampled * (1 + alpha * (attention - 0.5)) + alpha * residual
+        output = output.clamp(0, 1)
+
+        return output

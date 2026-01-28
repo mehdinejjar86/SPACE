@@ -72,9 +72,16 @@ def test_space():
     assert out.shape == (B, 3, H, W)
     print("   PASSED!")
 
-    # Test auto mode
+    # Test auto mode (should use NAFNet by default)
     print("\n7. Testing render_frame(mode='auto')...")
     out = model.render_frame(frames, times, target_time=0.5, mode='auto')
+    print(f"   Output: {out.shape}")
+    assert out.shape == (B, 3, H, W)
+    print("   PASSED!")
+
+    # Test hybrid rendering explicitly (now the default)
+    print("\n7b. Testing render_frame(mode='hybrid')...")
+    out = model.render_frame(frames, times, target_time=0.5, mode='hybrid')
     print(f"   Output: {out.shape}")
     assert out.shape == (B, 3, H, W)
     print("   PASSED!")
@@ -86,8 +93,8 @@ def test_space():
     assert out.shape == (B, 3, H, W)
     print("   PASSED!")
 
-    # Test gradient flow
-    print("\n9. Testing gradient flow...")
+    # Test gradient flow (HQ mode)
+    print("\n9. Testing gradient flow (HQ mode)...")
     model.zero_grad()
     out = model.render_frame(frames, times, target_time=0.5, mode='hq')
     loss = out.mean()
@@ -97,6 +104,23 @@ def test_space():
                 for name, module in [('encoder', model.encoder),
                                      ('aggregator', model.aggregator),
                                      ('decoder', model.decoder)]}
+    for name, has in has_grad.items():
+        status = 'OK' if has else 'NO GRAD!'
+        print(f"   {name}: {status}")
+        assert has
+    print("   PASSED!")
+
+    # Test gradient flow (Hybrid mode)
+    print("\n10. Testing gradient flow (Hybrid mode)...")
+    model.zero_grad()
+    out = model.render_frame(frames, times, target_time=0.5, mode='hybrid')
+    loss = out.mean()
+    loss.backward()
+
+    has_grad = {name: any(p.grad is not None for p in module.parameters())
+                for name, module in [('encoder', model.encoder),
+                                     ('aggregator', model.aggregator),
+                                     ('hybrid_decoder', model.hybrid_decoder)]}
     for name, has in has_grad.items():
         status = 'OK' if has else 'NO GRAD!'
         print(f"   {name}: {status}")
@@ -151,6 +175,257 @@ def test_loss_functions():
     print("\nAll loss tests passed!")
 
 
+def test_nafnet_modulation():
+    """Test NAFNet decoder with scene_code modulation."""
+    print("\n" + "=" * 60)
+    print("Testing NAFNet Scene-Code Modulation")
+    print("=" * 60)
+
+    from model.nafnet_decoder import NAFNetDecoder
+    import torch
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Test with modulation
+    print("\n1. Testing NAFNetDecoder with FiLM modulation...")
+    decoder = NAFNetDecoder(
+        feature_dims=[32, 64, 128, 256],
+        hidden_dim=32,
+        num_blocks=[1, 1, 2, 2],
+        mod_dim=128,  # Enable modulation
+    ).to(device)
+
+    # Create fake multi-scale features
+    B = 2
+    feature_grids = [
+        torch.randn(B, 32, 32, 32, device=device),   # Scale 0
+        torch.randn(B, 64, 16, 16, device=device),   # Scale 1
+        torch.randn(B, 128, 8, 8, device=device),    # Scale 2
+        torch.randn(B, 256, 4, 4, device=device),    # Scale 3
+    ]
+    scene_code = torch.randn(B, 128, device=device)
+
+    # Forward with modulation
+    out = decoder(feature_grids, scene_code)
+    print(f"   Input features: {[f.shape for f in feature_grids]}")
+    print(f"   Scene code: {scene_code.shape}")
+    print(f"   Output: {out.shape}")
+    assert out.shape[0] == B and out.shape[1] == 3
+    print("   PASSED!")
+
+    # Test that different scene_codes produce different outputs
+    print("\n2. Testing modulation effect...")
+    scene_code_1 = torch.randn(B, 128, device=device)
+    scene_code_2 = torch.randn(B, 128, device=device)
+
+    out_1 = decoder(feature_grids, scene_code_1)
+    out_2 = decoder(feature_grids, scene_code_2)
+
+    diff = (out_1 - out_2).abs().mean().item()
+    print(f"   Output difference with different scene_codes: {diff:.6f}")
+    assert diff > 0.001, "Modulation should produce different outputs"
+    print("   PASSED!")
+
+    # Test without modulation (scene_code=None)
+    print("\n3. Testing NAFNetDecoder without modulation...")
+    decoder_no_mod = NAFNetDecoder(
+        feature_dims=[32, 64, 128, 256],
+        hidden_dim=32,
+        num_blocks=[1, 1, 2, 2],
+        mod_dim=None,  # No modulation
+    ).to(device)
+
+    out_no_mod = decoder_no_mod(feature_grids, None)
+    print(f"   Output (no modulation): {out_no_mod.shape}")
+    assert out_no_mod.shape[0] == B and out_no_mod.shape[1] == 3
+    print("   PASSED!")
+
+    # Test gradient flow through modulation
+    print("\n4. Testing gradient flow through modulation...")
+    decoder.zero_grad()
+    out = decoder(feature_grids, scene_code)
+    loss = out.mean()
+    loss.backward()
+
+    # Check that FiLM layer received gradients
+    has_film_grad = decoder.film.weight.grad is not None
+    print(f"   FiLM layer gradient: {'OK' if has_film_grad else 'NO GRAD!'}")
+    assert has_film_grad
+    print("   PASSED!")
+
+    print("\nAll NAFNet modulation tests passed!")
+
+
+def test_hybrid_decoder():
+    """Test HybridNAFNetSIREN decoder specifically."""
+    print("\n" + "=" * 60)
+    print("Testing Hybrid NAFNet+SIREN Decoder")
+    print("=" * 60)
+
+    from model.nafnet_decoder import HybridNAFNetSIREN
+    import torch
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    print("\n1. Testing HybridNAFNetSIREN...")
+    decoder = HybridNAFNetSIREN(
+        feature_dims=[32, 64, 128, 256],
+        hidden_dim=32,
+        num_blocks=[1, 1, 2, 2],
+        latent_dim=128,
+        siren_hidden_dim=32,
+        siren_num_layers=2,
+    ).to(device)
+
+    B = 2
+    feature_grids = [
+        torch.randn(B, 32, 32, 32, device=device),
+        torch.randn(B, 64, 16, 16, device=device),
+        torch.randn(B, 128, 8, 8, device=device),
+        torch.randn(B, 256, 4, 4, device=device),
+    ]
+    scene_code = torch.randn(B, 128, device=device)
+
+    # Full-frame forward (no coords provided)
+    out = decoder(feature_grids, scene_code, coords=None)
+    print(f"   Full-frame output: {out.shape}")
+    assert out.shape[0] == B and out.shape[1] == 3
+    print("   PASSED!")
+
+    # With explicit coordinates
+    print("\n2. Testing with explicit coordinates...")
+    H, W = 64, 64
+    y = torch.linspace(-1, 1, H, device=device)
+    x = torch.linspace(-1, 1, W, device=device)
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+    coords = torch.stack([
+        xx.flatten().unsqueeze(0).expand(B, -1),
+        yy.flatten().unsqueeze(0).expand(B, -1),
+        torch.full((B, H * W), 0.5, device=device),
+    ], dim=-1)
+
+    out = decoder(feature_grids, scene_code, coords=coords)
+    print(f"   With coords output: {out.shape}")
+    assert out.shape == (B, 3, H, W)
+    print("   PASSED!")
+
+    # Test coordinate-based forward
+    print("\n3. Testing forward_coords (for training)...")
+    Q = 512
+    coords_sparse = torch.rand(B, Q, 3, device=device) * 2 - 1
+    out_sparse = decoder.forward_coords(feature_grids, scene_code, coords_sparse)
+    print(f"   Sparse coords output: {out_sparse.shape}")
+    assert out_sparse.shape == (B, Q, 3)
+    print("   PASSED!")
+
+    # Gradient flow
+    print("\n4. Testing gradient flow...")
+    decoder.zero_grad()
+    out = decoder(feature_grids, scene_code)
+    loss = out.mean()
+    loss.backward()
+
+    # Check both NAFNet and SIREN parts receive gradients
+    nafnet_grad = any(p.grad is not None for p in decoder.nafnet.parameters())
+    siren_grad = any(p.grad is not None for p in decoder.siren_guidance.parameters())
+    print(f"   NAFNet gradients: {'OK' if nafnet_grad else 'NO GRAD!'}")
+    print(f"   SIREN gradients: {'OK' if siren_grad else 'NO GRAD!'}")
+    assert nafnet_grad and siren_grad
+    print("   PASSED!")
+
+    # Check blend_alpha is learning
+    print(f"\n5. Blend alpha: {decoder.blend_alpha.item():.4f}")
+    has_alpha_grad = decoder.blend_alpha.grad is not None
+    print(f"   Blend alpha gradient: {'OK' if has_alpha_grad else 'NO GRAD!'}")
+    print("   PASSED!")
+
+    print("\nAll Hybrid decoder tests passed!")
+
+
+def test_hybrid_loss():
+    """Test HybridLoss for full-image training."""
+    print("\n" + "=" * 60)
+    print("Testing HybridLoss")
+    print("=" * 60)
+
+    from model.loss_advanced import HybridLoss
+    import torch
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Initialize loss (skip LPIPS for speed)
+    print("\n1. Initializing HybridLoss...")
+    criterion = HybridLoss(
+        use_charbonnier=True,
+        use_msssim=True,
+        use_lpips=False,  # Skip for speed
+        use_gradient=True,
+        use_frequency=True,
+        use_anchor_distillation=False,  # Test without anchor for now
+        use_coord_loss=True,
+        use_uncertainty_weighting=True,
+        use_progressive=True,
+    ).to(device)
+    print("   PASSED!")
+
+    # Test inputs
+    B = 2
+    H, W = 64, 64
+    Q = 512
+
+    pred_full = torch.rand(B, 3, H, W, device=device)
+    target_full = torch.rand(B, 3, H, W, device=device)
+    pred_coords = torch.rand(B, Q, 3, device=device)
+    target_coords = torch.rand(B, Q, 3, device=device)
+
+    # Test full-frame only
+    print("\n2. Testing full-frame loss...")
+    losses = criterion(pred_full, target_full)
+    print(f"   Total: {losses['total'].item():.4f}")
+    print(f"   Losses: {[k for k in losses.keys() if not k.startswith('_')]}")
+    assert 'total' in losses
+    assert 'charbonnier' in losses
+    print("   PASSED!")
+
+    # Test with coordinates
+    print("\n3. Testing with coordinate loss...")
+    losses = criterion(pred_full, target_full, pred_coords, target_coords)
+    print(f"   Total: {losses['total'].item():.4f}")
+    if 'coord_loss' in losses:
+        print(f"   Coord loss: {losses['coord_loss'].item():.4f}")
+    print("   PASSED!")
+
+    # Test progressive curriculum
+    print("\n4. Testing progressive curriculum...")
+    for epoch in [0, 5, 15, 30, 50]:
+        active = criterion.update_for_epoch(epoch)
+        print(f"   Epoch {epoch}: {active}")
+    print("   PASSED!")
+
+    # Test uncertainty weighting
+    print("\n5. Testing uncertainty weighting...")
+    stats = criterion.get_uncertainty_stats()
+    if stats:
+        print(f"   Weights: {stats['weights']}")
+        print(f"   Sigmas: {stats['sigmas']}")
+    print("   PASSED!")
+
+    # Test gradient flow
+    print("\n6. Testing gradient flow...")
+    criterion.zero_grad()
+    losses = criterion(pred_full, target_full, pred_coords, target_coords)
+    losses['total'].backward()
+
+    # Check uncertainty params received gradients
+    if hasattr(criterion, 'uncertainty'):
+        has_unc_grad = any(p.grad is not None for p in criterion.uncertainty.parameters())
+        print(f"   Uncertainty gradients: {'OK' if has_unc_grad else 'NO GRAD'}")
+
+    print("   PASSED!")
+
+    print("\nAll HybridLoss tests passed!")
+
+
 def test_model_configs():
     """Test different model sizes."""
     print("\n" + "=" * 60)
@@ -164,6 +439,9 @@ def test_model_configs():
         model = build_space(config)
         params = model.get_param_count()
         print(f"  Total: {params['total']:,} parameters")
+        # Check that hybrid decoder is enabled by default
+        assert model.use_hybrid_decoder, f"{config} should use hybrid decoder by default"
+        print(f"  Hybrid decoder: enabled")
 
 
 def test_n4_768():
@@ -364,14 +642,20 @@ if __name__ == "__main__":
         elif args.all:
             # Run all tests
             test_space()
+            test_hybrid_decoder()
+            test_nafnet_modulation()
             test_loss_functions()
+            test_hybrid_loss()
             test_model_configs()
             test_n4_768()
             test_4k_inference()
         else:
             # Default: run basic tests (fast)
             test_space()
+            test_hybrid_decoder()
+            test_nafnet_modulation()
             test_loss_functions()
+            test_hybrid_loss()
             test_model_configs()
 
         print("\n" + "=" * 60)

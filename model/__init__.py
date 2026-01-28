@@ -24,6 +24,8 @@ from .loss_advanced import (
     LaplacianPyramidLoss,
     CoordinateAnchorDistillationLoss,
     ProgressiveLossScheduler,
+    FullFrameAnchorDistillationLoss,
+    HybridLoss,
 )
 
 __all__ = [
@@ -59,4 +61,6 @@ __all__ = [
     'LaplacianPyramidLoss',
     'CoordinateAnchorDistillationLoss',
     'ProgressiveLossScheduler',
+    'FullFrameAnchorDistillationLoss',
+    'HybridLoss',
 ]

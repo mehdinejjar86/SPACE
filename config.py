@@ -36,10 +36,16 @@ class ModelConfig:
     refinement_iterations: int = 1
 
     # NAFNet-style decoder (alternative to fast_decoder)
-    use_nafnet_decoder: bool = True
+    use_nafnet_decoder: bool = False
     nafnet_hidden_dim: int = 64
     nafnet_num_blocks: List[int] = field(default_factory=lambda: [2, 2, 4, 4])
     nafnet_use_modulation: bool = True
+
+    # Hybrid NAFNet + SIREN decoder (recommended default)
+    # Combines NAFNet for full-frame structure with SIREN for coordinate-aware guidance
+    use_hybrid_decoder: bool = True
+    hybrid_siren_hidden_dim: int = 64
+    hybrid_siren_layers: int = 3
 
     # Preset config (overrides above if set)
     preset: Optional[str] = None  # 'tiny', 'base', 'large'
@@ -152,6 +158,11 @@ class TrainConfig:
 
     # Full-frame evaluation during training
     full_frame_every: int = 100  # Compute full-frame losses every N batches
+
+    # Hybrid Loss (for hybrid decoder training)
+    use_hybrid_loss: bool = True  # Use HybridLoss for hybrid decoder
+    hybrid_coord_samples: int = 1024  # Coordinate samples for SIREN guidance
+    hybrid_anchor_weight: float = 0.3  # Weight for anchor distillation
 
     # Gradient clipping
     grad_clip: float = 1.0
