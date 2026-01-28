@@ -188,6 +188,18 @@ def sample_coordinates(target_frame: torch.Tensor,
     return coords, target_rgb
 
 
+def sample_rgb_from_frame(frame: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+    """Sample RGB values from a full frame at given coordinates."""
+    grid = coords[..., :2].unsqueeze(2)  # [B, Q, 1, 2]
+    rgb = F.grid_sample(
+        frame, grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+    ).squeeze(-1).permute(0, 2, 1)  # [B, Q, 3]
+    return rgb
+
+
 def train_epoch(model: SPACE,
                 dataloader,
                 optimizer,
@@ -207,6 +219,12 @@ def train_epoch(model: SPACE,
     training_mode = getattr(config.train, 'training_mode', 'coordinate')
     use_inr = training_mode in ("coordinate", "hybrid")
     use_full = training_mode in ("full_image", "hybrid")
+    distill_enabled = getattr(config.train, 'distill_enabled', False)
+    distill_weight = float(getattr(config.train, 'distill_weight', 0.0))
+    distill_start_epoch = int(getattr(config.train, 'distill_start_epoch', 0))
+    distill_enabled = getattr(config.train, 'distill_enabled', False)
+    distill_weight = float(getattr(config.train, 'distill_weight', 0.0))
+    distill_start_epoch = int(getattr(config.train, 'distill_start_epoch', 0))
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
@@ -251,6 +269,14 @@ def train_epoch(model: SPACE,
                 for name, val in full_losses.items():
                     losses[f"full_{name}"] = val
                 total = total + config.train.full_image_loss_weight * full_losses['total']
+
+            if (distill_enabled and distill_weight > 0 and use_inr and use_full and
+                    pred_full is not None and pred_rgb is not None and epoch >= distill_start_epoch):
+                naf_rgb = sample_rgb_from_frame(pred_full, coords)
+                diff = naf_rgb - pred_rgb
+                distill = torch.sqrt(diff * diff + config.train.charbonnier_eps ** 2).mean()
+                losses['distill'] = distill
+                total = total + distill_weight * distill
 
             losses['total'] = total
 
@@ -375,6 +401,14 @@ def train_epoch_advanced(model: SPACE,
                 for name, val in full_losses.items():
                     losses[f"full_{name}"] = val
                 total = total + config.train.full_image_loss_weight * full_losses['total']
+
+            if (distill_enabled and distill_weight > 0 and use_inr and use_full and
+                    pred_full is not None and pred_rgb is not None and epoch >= distill_start_epoch):
+                naf_rgb = sample_rgb_from_frame(pred_full, coords)
+                diff = naf_rgb - pred_rgb
+                distill = torch.sqrt(diff * diff + config.train.charbonnier_eps ** 2).mean()
+                losses['distill'] = distill
+                total = total + distill_weight * distill
 
             losses['total'] = total
 

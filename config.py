@@ -110,6 +110,11 @@ class TrainConfig:
     curriculum_enabled: bool = True
     curriculum_fraction: float = 0.2
 
+    # Distillation (INR -> NAFNet) during training
+    distill_enabled: bool = True
+    distill_weight: float = 0.1
+    distill_start_epoch: int = 0
+
     # Coordinate sampling for INR training (only used when training_mode="coordinate")
     num_samples: int = 4096  # Coordinates per image per batch
     sample_strategy: str = "random"  # "random", "grid", "importance"
