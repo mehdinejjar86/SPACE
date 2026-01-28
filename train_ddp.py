@@ -922,7 +922,10 @@ def main_worker(rank: int, world_size: int, args):
     model = model.to(rank)
 
     if world_size > 1:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+        # fast_decoder params aren't used in the coordinate-query training path,
+        # so enable unused-parameter detection when it's present.
+        find_unused = bool(config.model.use_fast_decoder)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=find_unused)
 
     if is_main_process():
         base_model = model.module if hasattr(model, 'module') else model
