@@ -125,10 +125,17 @@ class X4K1000Dataset(data.Dataset):
 
     def _generate_samples(self) -> List[Tuple[int, int, List[int], int]]:
         """
-        Generate all (sequence, target, anchors, n_frames) tuples for all (step, N) pairs.
+        Generate all (sequence, target, anchors, n_frames) tuples using sliding window.
 
-        Each sequence can generate multiple training samples per (step, N) pair.
-        Samples from all (step, N) pairs are combined.
+        Sliding window approach:
+        - For step=7, N=4: window has anchors spaced by 7 frames
+        - Window slides through the 65-frame sequence
+        - Each window position generates samples for all valid target frames
+
+        Example (step=7, N=4):
+          Window at start=0: anchors=[0, 7, 14, 21], targets=1-6, 8-13, 15-20
+          Window at start=1: anchors=[1, 8, 15, 22], targets=2-7, 9-14, 16-21
+          ...continues until window reaches end of sequence
 
         Returns:
             List of (seq_idx, target_frame, anchors, n_frames) tuples
@@ -136,26 +143,42 @@ class X4K1000Dataset(data.Dataset):
         all_samples = []
 
         for step, n_frames in zip(self.steps, self.n_frames_list):
-            spacing = 2 * step  # step=5→10, step=31→62
-            anchors = [i * spacing for i in range(n_frames)]
+            # Window span: from first to last anchor
+            window_span = (n_frames - 1) * step  # e.g., N=4, step=7 → span=21
 
-            # Check if anchors fit in 65 frames (indices 0-64)
-            if anchors[-1] >= 65:
-                max_step = 64 // (2 * (n_frames - 1))
+            # Check if window fits in sequence
+            if window_span >= 65:
+                max_step = 64 // (n_frames - 1)
                 raise ValueError(
-                    f"step={step} with n_frames={n_frames} (spacing={spacing}) produces anchors={anchors}, "
+                    f"step={step} with n_frames={n_frames} produces window_span={window_span}, "
                     f"but sequence only has 65 frames (0-64). Max step for N={n_frames} is {max_step}"
                 )
 
-            # All target frames between first and last anchor (excluding anchors)
-            valid_targets = [i for i in range(anchors[0] + 1, anchors[-1]) if i not in anchors]
+            # Valid window starting positions
+            max_start = 64 - window_span  # e.g., 64-21=43 for step=7, N=4
+            num_windows = max_start + 1
 
-            # Generate all (seq_idx, target_frame, anchors, n_frames) tuples for this (step, N) pair
+            step_samples = 0
+
             for seq_idx in range(len(self.sequences)):
-                for target_frame in valid_targets:
-                    all_samples.append((seq_idx, target_frame, anchors, n_frames))
+                for window_start in range(num_windows):
+                    # Compute anchor positions for this window
+                    anchors = [window_start + i * step for i in range(n_frames)]
 
-            print(f"  STEP={step}, N={n_frames}: {len(valid_targets)} targets/seq × {len(self.sequences)} seqs = {len(valid_targets) * len(self.sequences)} samples")
+                    # Valid targets: all frames between first and last anchor, excluding anchors
+                    anchor_set = set(anchors)
+                    valid_targets = [
+                        i for i in range(anchors[0] + 1, anchors[-1])
+                        if i not in anchor_set
+                    ]
+
+                    # Generate sample for each target
+                    for target_frame in valid_targets:
+                        all_samples.append((seq_idx, target_frame, anchors, n_frames))
+                        step_samples += 1
+
+            targets_per_window = window_span - 1 - (n_frames - 2)  # span - 1 minus interior anchors
+            print(f"  STEP={step}, N={n_frames}: {num_windows} windows × {targets_per_window} targets × {len(self.sequences)} seqs = {step_samples} samples")
 
         return all_samples
 
