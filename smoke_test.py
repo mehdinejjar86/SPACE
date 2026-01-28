@@ -246,23 +246,128 @@ def test_n4_768():
     print("=" * 60)
 
 
+def test_4k_inference():
+    """Test inference at 4K resolution (4096x2160)."""
+    print("\n" + "=" * 60)
+    print("Testing 4K Inference (4096x2160)")
+    print("=" * 60)
+
+    from model import build_space
+    import time
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cpu':
+        print("WARNING: Running on CPU, this will be VERY slow!")
+        print("         Consider running on GPU cluster.")
+
+    # Build base model
+    print("\n1. Building SPACE (base config)...")
+    model = build_space('base')
+    model = model.to(device)
+    model.eval()
+
+    params = model.get_param_count()
+    print(f"   Total parameters: {params['total']:,}")
+
+    # Test with N=2 (typical for 8x interpolation start) and 4K resolution
+    B, N = 1, 2
+    H, W = 2160, 4096  # 4K UHD
+
+    print(f"\n2. Creating input: B={B}, N={N}, {W}x{H} (4K)")
+
+    # Check memory before allocation
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        mem_before = torch.cuda.memory_allocated() / 1024**3
+        print(f"   GPU memory before: {mem_before:.2f} GB")
+
+    frames = torch.randn(B, N, 3, H, W, device=device)
+    times = torch.tensor([[0.0, 1.0]] * B, device=device)
+
+    if device == 'cuda':
+        mem_after_input = torch.cuda.memory_allocated() / 1024**3
+        print(f"   GPU memory after input: {mem_after_input:.2f} GB")
+
+    # Test encoding
+    print("\n3. Testing encode()...")
+    with torch.no_grad():
+        start = time.time()
+        query_time = torch.tensor([0.5] * B, device=device)
+        encoding = model.encode(frames, times, query_time)
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        encode_time = time.time() - start
+    print(f"   Encode time: {encode_time:.3f}s")
+    print(f"   scene_code: {encoding['scene_code'].shape}")
+    print(f"   feature_grids: {len(encoding['feature_grids'])} scales")
+    for i, g in enumerate(encoding['feature_grids']):
+        print(f"     scale {i}: {g.shape}")
+
+    # Test render_frame (fast mode) - this is the key test
+    print("\n4. Testing render_frame(mode='fast') at 4K...")
+    with torch.no_grad():
+        start = time.time()
+        out = model.render_frame(frames, times, target_time=0.5, mode='fast')
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        render_time = time.time() - start
+    print(f"   Render time: {render_time:.3f}s")
+    print(f"   Output: {out.shape}")
+    assert out.shape == (B, 3, H, W), f"Expected {(B, 3, H, W)}, got {out.shape}"
+    print("   PASSED!")
+
+    # Check memory peak
+    if device == 'cuda':
+        mem_peak = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"\n5. GPU memory peak: {mem_peak:.2f} GB")
+
+    # Test chunked rendering (memory-efficient alternative)
+    print("\n6. Testing render_frame_chunked() at 4K...")
+    with torch.no_grad():
+        start = time.time()
+        out_chunked = model.render_frame_chunked(
+            frames, times, target_time=0.5, chunk_size=1024
+        )
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        chunked_time = time.time() - start
+    print(f"   Chunked render time: {chunked_time:.3f}s")
+    print(f"   Output: {out_chunked.shape}")
+    assert out_chunked.shape == (B, 3, H, W)
+    print("   PASSED!")
+
+    # Verify outputs are similar (chunked vs fast)
+    diff = (out - out_chunked).abs().mean()
+    print(f"   Difference (fast vs chunked): {diff.item():.6f}")
+
+    print("\n" + "=" * 60)
+    print("4K INFERENCE TEST PASSED!")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--n4-768', action='store_true', help='Run N=4 768x768 test only')
-    parser.add_argument('--all', action='store_true', help='Run all tests including N=4 768x768')
+    parser.add_argument('--4k', dest='test_4k', action='store_true', help='Run 4K inference test only')
+    parser.add_argument('--all', action='store_true', help='Run all tests including high-res')
     args = parser.parse_args()
 
     try:
         if args.n4_768:
             # Run only the N=4 768x768 test
             test_n4_768()
+        elif args.test_4k:
+            # Run only the 4K inference test
+            test_4k_inference()
         elif args.all:
             # Run all tests
             test_space()
             test_loss_functions()
             test_model_configs()
             test_n4_768()
+            test_4k_inference()
         else:
             # Default: run basic tests (fast)
             test_space()
