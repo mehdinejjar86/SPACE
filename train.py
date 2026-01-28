@@ -202,8 +202,8 @@ def sample_rgb_from_frame(frame: torch.Tensor, coords: torch.Tensor) -> torch.Te
 
 def _compute_ssim(pred, target, window_size: int = 11, sigma: float = 1.5):
     """Compute SSIM using a Gaussian window (expects inputs in [0, 1])."""
-    pred = pred.clamp(0, 1)
-    target = target.clamp(0, 1)
+    pred = pred.float().clamp(0, 1)
+    target = target.float().clamp(0, 1)
 
     device = pred.device
     dtype = pred.dtype

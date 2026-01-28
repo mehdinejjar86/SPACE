@@ -1033,8 +1033,8 @@ def _get_closest_anchors(available, target_idx, n=4):
 
 def _compute_ssim(pred, target, window_size: int = 11, sigma: float = 1.5):
     """Compute SSIM using a Gaussian window (expects inputs in [0, 1])."""
-    pred = pred.clamp(0, 1)
-    target = target.clamp(0, 1)
+    pred = pred.float().clamp(0, 1)
+    target = target.float().clamp(0, 1)
 
     device = pred.device
     dtype = pred.dtype
