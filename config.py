@@ -237,7 +237,7 @@ def get_tiny_config() -> Config:
     """Get tiny configuration for fast experimentation."""
     return Config(
         name="space_tiny",
-        model=ModelConfig(preset='tiny', use_nafnet_decoder=False, use_fast_decoder=True),
+        model=ModelConfig(preset='tiny', use_nafnet_decoder=True, use_fast_decoder=False),
         data=DataConfig(
             crop_size=128,
             num_workers=2,
@@ -247,7 +247,7 @@ def get_tiny_config() -> Config:
             epochs=50,
             num_samples=1024,
             log_every=50,
-            training_mode="coordinate",
+            training_mode="hybrid",
             # Disable heavy losses for speed
             use_lpips=False,
             use_laplacian=False,

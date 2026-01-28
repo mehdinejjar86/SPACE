@@ -588,8 +588,9 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
 
     total_losses = defaultdict(float)
     total_psnr = 0.0
+    total_ssim = 0.0
     total_samples = 0
-    dataset_totals = defaultdict(lambda: {'loss': 0.0, 'psnr': 0.0, 'samples': 0})
+    dataset_totals = defaultdict(lambda: {'loss': 0.0, 'psnr': 0.0, 'ssim': 0.0, 'samples': 0})
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process())
 
@@ -666,11 +667,14 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
 
             losses['total'] = total_loss
 
+        full_ssim = None
         if use_full and pred_full is not None:
             mse = F.mse_loss(pred_full.float(), target_frame.float())
+            psnr = 10 * torch.log10(1.0 / mse.clamp(min=1e-10))
+            full_ssim = _compute_ssim(pred_full.detach(), target_frame.detach())
         else:
             mse = F.mse_loss(pred_rgb.float(), target_rgb.float())
-        psnr = 10 * torch.log10(1.0 / mse.clamp(min=1e-10))
+            psnr = 10 * torch.log10(1.0 / mse.clamp(min=1e-10))
 
         scaler.scale(losses['total']).backward()
 
@@ -686,11 +690,15 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
             if isinstance(val, torch.Tensor):
                 total_losses[name] += val.item() * input_frames.shape[0]
         total_psnr += psnr.item() * input_frames.shape[0]
+        if full_ssim is not None:
+            total_ssim += full_ssim * input_frames.shape[0]
         total_samples += input_frames.shape[0]
 
         ds = dataset_totals[dataset_name]
         ds['loss'] += losses['total'].item() * input_frames.shape[0]
         ds['psnr'] += psnr.item() * input_frames.shape[0]
+        if full_ssim is not None:
+            ds['ssim'] += full_ssim * input_frames.shape[0]
         ds['samples'] += input_frames.shape[0]
 
         if is_main_process():
@@ -699,6 +707,8 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
                 'loss': f"{losses['total'].item():.4f}",
                 'psnr': f"{psnr.item():.2f}",
             }
+            if full_ssim is not None:
+                postfix['ssim'] = f"{full_ssim:.4f}"
             if 'coord_charbonnier' in losses:
                 postfix['charb'] = f"{losses['coord_charbonnier'].item():.4f}"
             pbar.set_postfix(postfix)
@@ -710,12 +720,17 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
                 if isinstance(val, torch.Tensor):
                     writer.add_scalar(f'train/{name}', val.item(), global_step)
             writer.add_scalar('train/psnr', psnr.item(), global_step)
+            if full_ssim is not None:
+                writer.add_scalar('train/ssim', full_ssim, global_step)
             writer.add_scalar(f"train/{dataset_name}_psnr", psnr.item(), global_step)
             writer.add_scalar(f"train/{dataset_name}_loss", losses['total'].item(), global_step)
+            if full_ssim is not None:
+                writer.add_scalar(f"train/{dataset_name}_ssim", full_ssim, global_step)
 
     metrics = {name: val / max(total_samples, 1) for name, val in total_losses.items()}
     metrics['loss'] = metrics.get('total', 0.0)
     metrics['psnr'] = total_psnr / max(total_samples, 1)
+    metrics['ssim'] = total_ssim / max(total_samples, 1) if total_samples > 0 else 0.0
     metrics['datasets'] = {}
     for name, ds in dataset_totals.items():
         if ds['samples'] == 0:
@@ -723,6 +738,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
         metrics['datasets'][name] = {
             'loss': ds['loss'] / ds['samples'],
             'psnr': ds['psnr'] / ds['samples'],
+            'ssim': ds['ssim'] / ds['samples'] if ds['samples'] > 0 else 0.0,
         }
     return metrics
 
@@ -1419,6 +1435,8 @@ def main_worker(rank: int, world_size: int, args):
             for name, m in train_metrics['datasets'].items():
                 writer.add_scalar(f"train/{name}_epoch_loss", m['loss'], epoch)
                 writer.add_scalar(f"train/{name}_epoch_psnr", m['psnr'], epoch)
+                if 'ssim' in m:
+                    writer.add_scalar(f"train/{name}_epoch_ssim", m['ssim'], epoch)
 
         # Validate on all datasets
         if epoch % config.train.val_every == 0 and val_loaders:

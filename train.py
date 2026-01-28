@@ -200,6 +200,41 @@ def sample_rgb_from_frame(frame: torch.Tensor, coords: torch.Tensor) -> torch.Te
     return rgb
 
 
+def _compute_ssim(pred, target, window_size: int = 11, sigma: float = 1.5):
+    """Compute SSIM using a Gaussian window (expects inputs in [0, 1])."""
+    pred = pred.clamp(0, 1)
+    target = target.clamp(0, 1)
+
+    device = pred.device
+    dtype = pred.dtype
+    channels = pred.shape[1]
+
+    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = (g / g.sum()).view(1, 1, -1)
+    window = (g.transpose(2, 1) @ g).view(1, 1, window_size, window_size)
+    window = window.expand(channels, 1, window_size, window_size)
+
+    mu1 = F.conv2d(pred, window, padding=window_size // 2, groups=channels)
+    mu2 = F.conv2d(target, window, padding=window_size // 2, groups=channels)
+
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(pred * pred, window, padding=window_size // 2, groups=channels) - mu1_sq
+    sigma2_sq = F.conv2d(target * target, window, padding=window_size // 2, groups=channels) - mu2_sq
+    sigma12 = F.conv2d(pred * target, window, padding=window_size // 2, groups=channels) - mu1_mu2
+
+    C1 = (0.01 ** 2)
+    C2 = (0.03 ** 2)
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    return ssim_map.mean().item()
+
+
 def train_epoch(model: SPACE,
                 dataloader,
                 optimizer,
@@ -214,6 +249,7 @@ def train_epoch(model: SPACE,
     total_loss = 0
     total_charbonnier = 0
     total_psnr = 0
+    total_ssim = 0
     num_batches = 0
 
     training_mode = getattr(config.train, 'training_mode', 'coordinate')
@@ -295,17 +331,23 @@ def train_epoch(model: SPACE,
         total_loss += losses['total'].item()
         if 'coord_charbonnier' in losses:
             total_charbonnier += losses['coord_charbonnier'].item()
+        full_ssim = None
         if use_full and pred_full is not None:
             mse = F.mse_loss(pred_full.float(), target_frame.float())
+            full_ssim = _compute_ssim(pred_full.detach(), target_frame.detach())
         else:
             mse = F.mse_loss(pred_rgb.float(), target_rgb.float())
         total_psnr += (10 * torch.log10(1.0 / mse.clamp(min=1e-10))).item()
+        if full_ssim is not None:
+            total_ssim += full_ssim
         num_batches += 1
 
         # Update progress bar
         postfix = {'loss': f"{losses['total'].item():.4f}"}
         if 'coord_charbonnier' in losses:
             postfix['charb'] = f"{losses['coord_charbonnier'].item():.4f}"
+        if full_ssim is not None:
+            postfix['ssim'] = f"{full_ssim:.4f}"
         pbar.set_postfix(postfix)
 
         # Log to tensorboard
@@ -314,11 +356,14 @@ def train_epoch(model: SPACE,
             for name, val in losses.items():
                 if isinstance(val, torch.Tensor):
                     writer.add_scalar(f"train/{name}", val.item(), global_step)
+            if full_ssim is not None:
+                writer.add_scalar("train/ssim", full_ssim, global_step)
 
     return {
         'loss': total_loss / num_batches,
         'charbonnier': total_charbonnier / max(num_batches, 1),
         'psnr': total_psnr / max(num_batches, 1),
+        'ssim': total_ssim / max(num_batches, 1),
     }
 
 
@@ -347,6 +392,7 @@ def train_epoch_advanced(model: SPACE,
 
     total_losses = defaultdict(float)
     total_psnr = 0.0
+    total_ssim = 0.0
     num_batches = 0
 
     training_mode = getattr(config.train, 'training_mode', 'coordinate')
@@ -429,11 +475,15 @@ def train_epoch_advanced(model: SPACE,
                 total_losses[name] += val.item()
             elif name != '_weights':
                 total_losses[name] += val
+        full_ssim = None
         if use_full and pred_full is not None:
             mse = F.mse_loss(pred_full.float(), target_frame.float())
+            full_ssim = _compute_ssim(pred_full.detach(), target_frame.detach())
         else:
             mse = F.mse_loss(pred_rgb.float(), target_rgb.float())
         total_psnr += (10 * torch.log10(1.0 / mse.clamp(min=1e-10))).item()
+        if full_ssim is not None:
+            total_ssim += full_ssim
         num_batches += 1
 
         # Progress bar
@@ -442,6 +492,8 @@ def train_epoch_advanced(model: SPACE,
             postfix['charb'] = f"{losses['coord_charbonnier'].item():.4f}"
         if 'coord_anchor_distill' in losses:
             postfix['anchor'] = f"{losses['coord_anchor_distill'].item():.4f}"
+        if full_ssim is not None:
+            postfix['ssim'] = f"{full_ssim:.4f}"
         pbar.set_postfix(postfix)
 
         # Tensorboard logging
@@ -450,6 +502,8 @@ def train_epoch_advanced(model: SPACE,
             for name, val in losses.items():
                 if isinstance(val, torch.Tensor):
                     writer.add_scalar(f'train/{name}', val.item(), global_step)
+            if full_ssim is not None:
+                writer.add_scalar("train/ssim", full_ssim, global_step)
 
             # Log uncertainty weights
             if criterion.use_uncertainty_weighting:
@@ -481,6 +535,7 @@ def train_epoch_advanced(model: SPACE,
     metrics = {name: val / max(num_batches, 1) for name, val in total_losses.items()}
     metrics['loss'] = metrics.get('total', 0.0)
     metrics['psnr'] = total_psnr / max(num_batches, 1)
+    metrics['ssim'] = total_ssim / max(num_batches, 1)
     return metrics
 
 
