@@ -143,19 +143,22 @@ class X4K1000Dataset(data.Dataset):
         all_samples = []
 
         for step, n_frames in zip(self.steps, self.n_frames_list):
+            # Anchor spacing = step + 1 (step=7 means 0→8, spacing of 8)
+            spacing = step + 1
+
             # Window span: from first to last anchor
-            window_span = (n_frames - 1) * step  # e.g., N=4, step=7 → span=21
+            window_span = (n_frames - 1) * spacing  # e.g., N=4, step=7 → spacing=8 → span=24
 
             # Check if window fits in sequence
             if window_span >= 65:
-                max_step = 64 // (n_frames - 1)
+                max_step = 64 // (n_frames - 1) - 1
                 raise ValueError(
-                    f"step={step} with n_frames={n_frames} produces window_span={window_span}, "
+                    f"step={step} with n_frames={n_frames} (spacing={spacing}) produces window_span={window_span}, "
                     f"but sequence only has 65 frames (0-64). Max step for N={n_frames} is {max_step}"
                 )
 
             # Valid window starting positions
-            max_start = 64 - window_span  # e.g., 64-21=43 for step=7, N=4
+            max_start = 64 - window_span  # e.g., 64-24=40 for step=7, N=4
             num_windows = max_start + 1
 
             step_samples = 0
@@ -163,7 +166,7 @@ class X4K1000Dataset(data.Dataset):
             for seq_idx in range(len(self.sequences)):
                 for window_start in range(num_windows):
                     # Compute anchor positions for this window
-                    anchors = [window_start + i * step for i in range(n_frames)]
+                    anchors = [window_start + i * spacing for i in range(n_frames)]
 
                     # Valid targets: all frames between first and last anchor, excluding anchors
                     anchor_set = set(anchors)
