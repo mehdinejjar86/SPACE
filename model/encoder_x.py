@@ -288,10 +288,6 @@ class FrameEncoderX(nn.Module):
         )
         self.dims = dims
 
-    def set_gradient_checkpointing(self, enable: bool = True):
-        """Enable or disable gradient checkpointing."""
-        self.multi_scale_encoder.set_gradient_checkpointing(enable)
-
         # Global pooling + projection for latent vector
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.latent_proj = nn.Sequential(
@@ -299,6 +295,10 @@ class FrameEncoderX(nn.Module):
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim),
         )
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing."""
+        self.multi_scale_encoder.set_gradient_checkpointing(enable)
 
     def forward(self, frames: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
