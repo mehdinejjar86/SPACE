@@ -228,10 +228,78 @@ class SPACE(nn.Module):
             encoding['biases'],
         )
 
+    def _normalize_target_time(self, target_time, B: int, device: torch.device) -> torch.Tensor:
+        """Normalize target_time to shape [B, 1] on device."""
+        if isinstance(target_time, (int, float)):
+            return torch.full((B, 1), float(target_time), device=device)
+        t = target_time.to(device)
+        if t.dim() == 2:
+            t = t.squeeze(1)
+        return t.view(B, 1)
+
+    def _render_full_from_encoding(self,
+                                   encoding: Dict,
+                                   H: int,
+                                   W: int,
+                                   target_time,
+                                   mode: str = 'auto') -> torch.Tensor:
+        """Render full frame from a precomputed encoding (no re-encode)."""
+        B = encoding['scene_code'].shape[0]
+        device = encoding['scene_code'].device
+
+        if mode == 'auto':
+            if self.use_nafnet_decoder:
+                mode = 'nafnet'
+            elif H * W > 256 * 256:
+                mode = 'fast'
+            else:
+                mode = 'hq'
+
+        if mode == 'nafnet' and self.use_nafnet_decoder:
+            pred = self.nafnet_decoder(encoding['feature_grids'], encoding['scene_code'])
+            if pred.shape[2:] != (H, W):
+                pred = F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=True)
+            return pred
+
+        if mode == 'fast' and self.use_fast_decoder:
+            coarse = self.fast_decoder(encoding['feature_grids'])
+            if coarse.shape[2:] != (H, W):
+                coarse = F.interpolate(coarse, size=(H, W),
+                                       mode='bilinear', align_corners=True)
+            if self.use_refinement:
+                feature_grids_resized = []
+                for feat in encoding['feature_grids']:
+                    if feat.shape[2:] != (H, W):
+                        feat = F.interpolate(feat, size=(H, W),
+                                             mode='bilinear', align_corners=True)
+                    feature_grids_resized.append(feat)
+                refined = self.refinement(coarse, feature_grids_resized)
+                return refined
+            return coarse
+
+        # HQ: coordinate-based rendering from encoding
+        query_time = self._normalize_target_time(target_time, B, device)
+        t_vals = query_time.squeeze(1).view(B, 1).expand(B, H * W)
+
+        y = torch.linspace(-1, 1, H, device=device)
+        x = torch.linspace(-1, 1, W, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        coords = torch.stack([
+            xx.flatten().unsqueeze(0).expand(B, -1),
+            yy.flatten().unsqueeze(0).expand(B, -1),
+            t_vals,
+        ], dim=-1)
+
+        rgb = self.decode_coords(coords, encoding)
+        return rgb.view(B, H, W, 3).permute(0, 3, 1, 2)
+
     def forward(self,
                 frames: torch.Tensor,
                 frame_times: torch.Tensor,
-                query_coords: torch.Tensor) -> torch.Tensor:
+                query_coords: Optional[torch.Tensor],
+                target_time: Optional[torch.Tensor] = None,
+                return_full: bool = False,
+                full_mode: str = 'auto'):
         """
         Query the spacetime volume at arbitrary coordinates.
 
@@ -239,13 +307,39 @@ class SPACE(nn.Module):
             frames: [B, N, 3, H, W] input frames
             frame_times: [B, N] frame timestamps
             query_coords: [B, Q, 3] query (x, y, t) coordinates
+            target_time: Optional target time for full-frame rendering
+            return_full: If True, also return full-frame prediction
+            full_mode: 'auto', 'nafnet', 'fast', or 'hq'
 
         Returns:
             [B, Q, 3] RGB values
         """
-        query_time = query_coords[:, 0, 2:3]  # Assume same t for all queries
+        B = frames.shape[0]
+        device = frames.device
+
+        if query_coords is None and not return_full:
+            raise ValueError("query_coords is required unless return_full=True")
+
+        # Use target_time if provided, otherwise infer from query_coords
+        if target_time is not None:
+            query_time = self._normalize_target_time(target_time, B, device)
+        else:
+            query_time = query_coords[:, 0, 2:3]  # Assume same t for all queries
+
         encoding = self.encode(frames, frame_times, query_time)
-        return self.decode_coords(query_coords, encoding)
+
+        pred_rgb = None
+        if query_coords is not None:
+            pred_rgb = self.decode_coords(query_coords, encoding)
+
+        if return_full:
+            H, W = frames.shape[3], frames.shape[4]
+            pred_full = self._render_full_from_encoding(
+                encoding, H, W, target_time=query_time.squeeze(1), mode=full_mode
+            )
+            return (pred_rgb, pred_full) if pred_rgb is not None else pred_full
+
+        return pred_rgb
 
     def render_frame(self,
                      frames: torch.Tensor,

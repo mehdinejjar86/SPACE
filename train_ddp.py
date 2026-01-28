@@ -625,12 +625,25 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
             losses = {}
             pred_full = None
             pred_rgb = None
+            full_mode = None
+
+            if use_full:
+                net = model.module if hasattr(model, 'module') else model
+                full_mode = 'nafnet' if getattr(net, 'use_nafnet_decoder', False) else 'fast'
 
             if use_inr:
                 coords, target_rgb = sample_coordinates(
                     target_frame, config.train.num_samples, target_time
                 )
-                pred_rgb = model(input_frames, input_times, coords)
+                if use_full:
+                    pred_rgb, pred_full = model(
+                        input_frames, input_times, coords,
+                        target_time=target_time,
+                        return_full=True,
+                        full_mode=full_mode,
+                    )
+                else:
+                    pred_rgb = model(input_frames, input_times, coords)
 
                 # Compute coordinate loss
                 if hasattr(criterion, 'uncertainty'):
@@ -648,10 +661,13 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
                     losses[f"coord_{name}"] = val
                 total_loss = total_loss + config.train.coordinate_loss_weight * coord_losses['total']
 
-            if use_full:
-                net = model.module if hasattr(model, 'module') else model
-                full_mode = 'nafnet' if getattr(net, 'use_nafnet_decoder', False) else 'fast'
-                pred_full = net.render_frame(input_frames, input_times, target_time, mode=full_mode)
+            if use_full and pred_full is None:
+                pred_full = model(
+                    input_frames, input_times, None,
+                    target_time=target_time,
+                    return_full=True,
+                    full_mode=full_mode,
+                )
                 full_losses = criterion(pred_full, target_frame, compute_all=True)
                 for name, val in full_losses.items():
                     losses[f"full_{name}"] = val
