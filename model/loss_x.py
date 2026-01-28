@@ -175,16 +175,19 @@ class SSIMLoss(nn.Module):
 
         pad = self.window_size // 2
 
-        mu1 = F.conv2d(pred, self.window, padding=pad, groups=3)
-        mu2 = F.conv2d(target, self.window, padding=pad, groups=3)
+        # Ensure window is on same device as input
+        window = self.window.to(pred.device)
+
+        mu1 = F.conv2d(pred, window, padding=pad, groups=3)
+        mu2 = F.conv2d(target, window, padding=pad, groups=3)
 
         mu1_sq = mu1 ** 2
         mu2_sq = mu2 ** 2
         mu1_mu2 = mu1 * mu2
 
-        sigma1_sq = F.conv2d(pred ** 2, self.window, padding=pad, groups=3) - mu1_sq
-        sigma2_sq = F.conv2d(target ** 2, self.window, padding=pad, groups=3) - mu2_sq
-        sigma12 = F.conv2d(pred * target, self.window, padding=pad, groups=3) - mu1_mu2
+        sigma1_sq = F.conv2d(pred ** 2, window, padding=pad, groups=3) - mu1_sq
+        sigma2_sq = F.conv2d(target ** 2, window, padding=pad, groups=3) - mu2_sq
+        sigma12 = F.conv2d(pred * target, window, padding=pad, groups=3) - mu1_mu2
 
         ssim = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
                ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
