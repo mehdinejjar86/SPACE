@@ -1,0 +1,28 @@
+# SPACE: Spacetime Implicit Neural Representation
+# Requirements
+
+# Core
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data processing
+Pillow>=9.0.0
+numpy>=1.20.0
+
+# Training utilities
+tqdm>=4.60.0
+tensorboard>=2.10.0
+
+# Optional: Weights & Biases logging
+# wandb>=0.13.0
+
+# Advanced loss system
+lpips>=0.1.4
+
+# Optional: Better image metrics
+# pytorch-msssim>=0.2.0
+
+# Development
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0
