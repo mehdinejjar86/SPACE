@@ -291,7 +291,76 @@ def resolve_x4k_root(x4k_path: str) -> str:
     return str(path)
 
 
-def create_train_loader(config, rank: int, world_size: int):
+def _select_x4k_pairs_for_n(data_config, target_n: int):
+    pairs = list(zip(data_config.x4k_steps, data_config.x4k_n_frames))
+    selected = [(s, n) for s, n in pairs if n == target_n]
+    if not selected:
+        selected = [pairs[0]]
+    steps = [s for s, _ in selected]
+    n_frames = [n for _, n in selected]
+    return steps, n_frames
+
+
+def get_curriculum_settings(config, epoch: int):
+    """
+    Curriculum schedule (first fraction of training):
+      0) Vimeo only
+      1) X4K only, N=4
+      2) X4K only, N=3
+      3) X4K only, N=2
+    Then switch to full mixed training.
+    """
+    data_config = config.data
+    train_config = config.train
+
+    if not getattr(train_config, 'curriculum_enabled', False):
+        mode = "mixed" if data_config.use_mixed_training else "vimeo_only"
+        return {
+            'name': mode,
+            'mode': mode,
+            'x4k_steps': data_config.x4k_steps,
+            'x4k_n_frames': data_config.x4k_n_frames,
+            'dataset_ratios': data_config.dataset_ratios,
+        }
+
+    total_epochs = max(1, train_config.epochs)
+    cur_epochs = max(1, int(total_epochs * getattr(train_config, 'curriculum_fraction', 0.2)))
+
+    if epoch >= cur_epochs:
+        mode = "mixed" if data_config.use_mixed_training else "vimeo_only"
+        return {
+            'name': 'mixed_full' if mode == "mixed" else 'vimeo_only',
+            'mode': mode,
+            'x4k_steps': data_config.x4k_steps,
+            'x4k_n_frames': data_config.x4k_n_frames,
+            'dataset_ratios': data_config.dataset_ratios,
+        }
+
+    stage_len = max(1, cur_epochs // 4)
+    stage = min(3, epoch // stage_len)
+
+    if stage == 0:
+        return {
+            'name': 'vimeo_only',
+            'mode': 'vimeo_only',
+            'x4k_steps': data_config.x4k_steps,
+            'x4k_n_frames': data_config.x4k_n_frames,
+            'dataset_ratios': data_config.dataset_ratios,
+        }
+
+    target_n = 4 if stage == 1 else 3 if stage == 2 else 2
+    steps, n_frames = _select_x4k_pairs_for_n(data_config, target_n)
+    return {
+        'name': f'x4k_only_n{target_n}',
+        'mode': 'x4k_only',
+        'x4k_steps': steps,
+        'x4k_n_frames': n_frames,
+        'dataset_ratios': data_config.dataset_ratios,
+    }
+
+
+def create_train_loader(config, rank: int, world_size: int, mode: str = None,
+                        x4k_steps=None, x4k_n_frames=None, dataset_ratios=None):
     """
     Create training dataloader with DDP support.
 
@@ -302,8 +371,56 @@ def create_train_loader(config, rank: int, world_size: int):
     """
     data_config = config.data
     train_config = config.train
+    mode = mode or ("mixed" if data_config.use_mixed_training else "vimeo_only")
+    x4k_steps = x4k_steps if x4k_steps is not None else data_config.x4k_steps
+    x4k_n_frames = x4k_n_frames if x4k_n_frames is not None else data_config.x4k_n_frames
+    dataset_ratios = dataset_ratios if dataset_ratios is not None else data_config.dataset_ratios
 
-    if data_config.use_mixed_training:
+    if mode == "x4k_only":
+        # X4K-only training (variable N per step)
+        if is_main_process():
+            print("  Train (X4K only)...")
+
+        x4k_root = resolve_x4k_root(data_config.x4k_root)
+        x4k = X4K1000Dataset(
+            root=x4k_root,
+            split="train",
+            steps=x4k_steps,
+            n_frames=x4k_n_frames,
+            crop_size=data_config.x4k_crop_size,
+            aug_flip=True,
+        )
+
+        if world_size > 1:
+            x4k_sampler = DistributedX4KBatchSampler(
+                x4k,
+                batch_size=train_config.batch_size,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True,
+            )
+        else:
+            x4k_sampler = X4KBatchSampler(
+                x4k,
+                batch_size=train_config.batch_size,
+                shuffle=True,
+                drop_last=True,
+            )
+
+        x4k_loader = DataLoader(
+            x4k,
+            batch_sampler=x4k_sampler,
+            num_workers=max(1, data_config.num_workers // 2),
+            pin_memory=data_config.pin_memory,
+            collate_fn=x4k_collate,
+        )
+
+        if is_main_process():
+            print(f"    X4K: {len(x4k)} samples (steps/N={list(zip(x4k_steps, x4k_n_frames))})")
+        return x4k_loader, x4k_sampler
+
+    if mode == "mixed":
         # Mixed training: Vimeo (N=2) + X4K (variable N per step)
         if is_main_process():
             print("  Using mixed Vimeo + X4K training (variable N)...")
@@ -324,15 +441,15 @@ def create_train_loader(config, rank: int, world_size: int):
         x4k = X4K1000Dataset(
             root=x4k_root,
             split="train",
-            steps=data_config.x4k_steps,      # e.g., [5, 31, 31]
-            n_frames=data_config.x4k_n_frames, # e.g., [4, 3, 2]
+            steps=x4k_steps,      # e.g., [5, 31, 31]
+            n_frames=x4k_n_frames, # e.g., [4, 3, 2]
             crop_size=data_config.x4k_crop_size,
             aug_flip=True,
         )
 
         if is_main_process():
             print(f"    Vimeo: {len(vimeo)} samples (N=2)")
-            step_n_pairs = list(zip(data_config.x4k_steps, data_config.x4k_n_frames))
+            step_n_pairs = list(zip(x4k_steps, x4k_n_frames))
             print(f"    X4K: {len(x4k)} samples (steps/N={step_n_pairs})")
 
         # Create separate loaders for Vimeo and X4K
@@ -381,12 +498,12 @@ def create_train_loader(config, rank: int, world_size: int):
 
         if is_main_process():
             print(f"    Vimeo batches: {len(vimeo_loader)}, X4K batches: {len(x4k_sampler)}")
-            print(f"    Dataset ratios: {data_config.dataset_ratios}")
+            print(f"    Dataset ratios: {dataset_ratios}")
 
         # Return MixedDataLoaders wrapper
         mixed_loader = MixedDataLoaders(
             vimeo_loader, x4k_loader,
-            ratios=data_config.dataset_ratios,
+            ratios=dataset_ratios,
         )
 
         # Return both samplers for epoch updates
@@ -1164,8 +1281,33 @@ def main_worker(rank: int, world_size: int, args):
     # Create dataloaders
     if is_main_process():
         print("\nCreating dataloaders...")
-    train_loader, train_sampler = create_train_loader(config, rank, world_size)
     val_loaders = create_validation_loaders(config, rank, world_size)
+
+    train_loader = None
+    train_sampler = None
+    curriculum_key = None
+
+    def setup_train_loader_for_epoch(ep: int):
+        nonlocal train_loader, train_sampler, curriculum_key
+        settings = get_curriculum_settings(config, ep)
+        key = (
+            settings['mode'],
+            tuple(settings['x4k_steps']) if settings['x4k_steps'] is not None else None,
+            tuple(settings['x4k_n_frames']) if settings['x4k_n_frames'] is not None else None,
+            tuple(settings['dataset_ratios']) if settings['dataset_ratios'] is not None else None,
+        )
+        if key != curriculum_key:
+            train_loader, train_sampler = create_train_loader(
+                config, rank, world_size,
+                mode=settings['mode'],
+                x4k_steps=settings['x4k_steps'],
+                x4k_n_frames=settings['x4k_n_frames'],
+                dataset_ratios=settings['dataset_ratios'],
+            )
+            curriculum_key = key
+            if is_main_process():
+                print(f"  Curriculum phase: {settings['name']}")
+        return train_loader, train_sampler
 
     if not val_loaders:
         if is_main_process():
@@ -1224,6 +1366,9 @@ def main_worker(rank: int, world_size: int, args):
         print(f"{'='*60}\n")
 
     for epoch in range(start_epoch, config.train.epochs):
+        # Rebuild train loader if curriculum phase changes
+        train_loader, train_sampler = setup_train_loader_for_epoch(epoch)
+
         # Set epoch for distributed sampler(s)
         if train_sampler is not None:
             if isinstance(train_sampler, tuple):

@@ -106,6 +106,10 @@ class TrainConfig:
     coordinate_loss_weight: float = 1.0
     full_image_loss_weight: float = 1.0
 
+    # Curriculum (first fraction of training)
+    curriculum_enabled: bool = True
+    curriculum_fraction: float = 0.2
+
     # Coordinate sampling for INR training (only used when training_mode="coordinate")
     num_samples: int = 4096  # Coordinates per image per batch
     sample_strategy: str = "random"  # "random", "grid", "importance"
