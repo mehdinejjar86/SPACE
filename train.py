@@ -113,7 +113,18 @@ def create_model(config) -> SPACE:
 
     # Use preset if specified
     if model_config.preset:
-        return build_space(model_config.preset)
+        return build_space(
+            model_config.preset,
+            use_feature_grids=model_config.use_feature_grids,
+            use_fast_decoder=model_config.use_fast_decoder,
+            use_refinement=model_config.use_refinement,
+            refinement_hidden_dim=model_config.refinement_hidden_dim,
+            refinement_num_blocks=model_config.refinement_num_blocks,
+            use_nafnet_decoder=model_config.use_nafnet_decoder,
+            nafnet_hidden_dim=model_config.nafnet_hidden_dim,
+            nafnet_num_blocks=model_config.nafnet_num_blocks,
+            nafnet_use_modulation=model_config.nafnet_use_modulation,
+        )
 
     # Otherwise use explicit parameters
     return SPACE(
@@ -126,6 +137,13 @@ def create_model(config) -> SPACE:
         omega_0=model_config.omega_0,
         use_feature_grids=model_config.use_feature_grids,
         use_fast_decoder=model_config.use_fast_decoder,
+        use_refinement=model_config.use_refinement,
+        refinement_hidden_dim=model_config.refinement_hidden_dim,
+        refinement_num_blocks=model_config.refinement_num_blocks,
+        use_nafnet_decoder=model_config.use_nafnet_decoder,
+        nafnet_hidden_dim=model_config.nafnet_hidden_dim,
+        nafnet_num_blocks=model_config.nafnet_num_blocks,
+        nafnet_use_modulation=model_config.nafnet_use_modulation,
     )
 
 
@@ -183,7 +201,12 @@ def train_epoch(model: SPACE,
 
     total_loss = 0
     total_charbonnier = 0
+    total_psnr = 0
     num_batches = 0
+
+    training_mode = getattr(config.train, 'training_mode', 'coordinate')
+    use_inr = training_mode in ("coordinate", "hybrid")
+    use_full = training_mode in ("full_image", "hybrid")
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
@@ -199,21 +222,37 @@ def train_epoch(model: SPACE,
         else:
             target_time = target_time.to(device)
 
-        # Sample coordinates from target frame
-        coords, target_rgb = sample_coordinates(
-            target_frame,
-            config.train.num_samples,
-            target_time
-        )
-
         # Forward pass with mixed precision
         optimizer.zero_grad()
 
         amp_dtype = torch.bfloat16 if config.train.amp_dtype == "bfloat16" else torch.float16
         with amp.autocast(device_type='cuda', enabled=config.train.use_amp, dtype=amp_dtype):
-            pred_rgb = model(input_frames, input_times, coords)
-            # Use SPACELoss (only charbonnier for coordinate sampling)
-            losses = criterion(pred_rgb, target_rgb, compute_all=False)
+            total = torch.tensor(0.0, device=device)
+            losses = {}
+            pred_full = None
+            pred_rgb = None
+
+            if use_inr:
+                coords, target_rgb = sample_coordinates(
+                    target_frame,
+                    config.train.num_samples,
+                    target_time
+                )
+                pred_rgb = model(input_frames, input_times, coords)
+                coord_losses = criterion(pred_rgb, target_rgb, compute_all=False)
+                for name, val in coord_losses.items():
+                    losses[f"coord_{name}"] = val
+                total = total + config.train.coordinate_loss_weight * coord_losses['total']
+
+            if use_full:
+                full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
+                pred_full = model.render_frame(input_frames, input_times, target_time, mode=full_mode)
+                full_losses = criterion(pred_full, target_frame, compute_all=True)
+                for name, val in full_losses.items():
+                    losses[f"full_{name}"] = val
+                total = total + config.train.full_image_loss_weight * full_losses['total']
+
+            losses['total'] = total
 
         # Backward pass
         scaler.scale(losses['total']).backward()
@@ -228,24 +267,32 @@ def train_epoch(model: SPACE,
 
         # Accumulate metrics
         total_loss += losses['total'].item()
-        total_charbonnier += losses['charbonnier'].item()
+        if 'coord_charbonnier' in losses:
+            total_charbonnier += losses['coord_charbonnier'].item()
+        if use_full and pred_full is not None:
+            mse = F.mse_loss(pred_full.float(), target_frame.float())
+        else:
+            mse = F.mse_loss(pred_rgb.float(), target_rgb.float())
+        total_psnr += (10 * torch.log10(1.0 / mse.clamp(min=1e-10))).item()
         num_batches += 1
 
         # Update progress bar
-        pbar.set_postfix({
-            'loss': f"{losses['total'].item():.4f}",
-            'charb': f"{losses['charbonnier'].item():.4f}",
-        })
+        postfix = {'loss': f"{losses['total'].item():.4f}"}
+        if 'coord_charbonnier' in losses:
+            postfix['charb'] = f"{losses['coord_charbonnier'].item():.4f}"
+        pbar.set_postfix(postfix)
 
         # Log to tensorboard
         global_step = epoch * len(dataloader) + batch_idx
         if writer and batch_idx % config.train.log_every == 0:
-            writer.add_scalar('train/loss', losses['total'].item(), global_step)
-            writer.add_scalar('train/charbonnier', losses['charbonnier'].item(), global_step)
+            for name, val in losses.items():
+                if isinstance(val, torch.Tensor):
+                    writer.add_scalar(f"train/{name}", val.item(), global_step)
 
     return {
         'loss': total_loss / num_batches,
-        'charbonnier': total_charbonnier / num_batches,
+        'charbonnier': total_charbonnier / max(num_batches, 1),
+        'psnr': total_psnr / max(num_batches, 1),
     }
 
 
@@ -273,7 +320,12 @@ def train_epoch_advanced(model: SPACE,
     print(f"  Active losses: {active_losses}")
 
     total_losses = defaultdict(float)
+    total_psnr = 0.0
     num_batches = 0
+
+    training_mode = getattr(config.train, 'training_mode', 'coordinate')
+    use_inr = training_mode in ("coordinate", "hybrid")
+    use_full = training_mode in ("full_image", "hybrid")
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
@@ -289,28 +341,42 @@ def train_epoch_advanced(model: SPACE,
         else:
             target_time = target_time.to(device)
 
-        # Sample coordinates from target frame
-        coords, target_rgb = sample_coordinates(
-            target_frame,
-            config.train.num_samples,
-            target_time
-        )
-
         optimizer.zero_grad()
 
         amp_dtype = torch.bfloat16 if config.train.amp_dtype == "bfloat16" else torch.float16
         with amp.autocast(device_type='cuda', enabled=config.train.use_amp, dtype=amp_dtype):
-            # Forward pass
-            pred_rgb = model(input_frames, input_times, coords)
+            total = torch.tensor(0.0, device=device)
+            losses = {}
+            pred_full = None
+            pred_rgb = None
 
-            # Compute loss with anchor distillation
-            losses = criterion(
-                pred_rgb, target_rgb,
-                model=model,
-                input_frames=input_frames,
-                input_times=input_times,
-                compute_all=False  # Coordinate mode
-            )
+            if use_inr:
+                coords, target_rgb = sample_coordinates(
+                    target_frame,
+                    config.train.num_samples,
+                    target_time
+                )
+                pred_rgb = model(input_frames, input_times, coords)
+                coord_losses = criterion(
+                    pred_rgb, target_rgb,
+                    model=model,
+                    input_frames=input_frames,
+                    input_times=input_times,
+                    compute_all=False
+                )
+                for name, val in coord_losses.items():
+                    losses[f"coord_{name}"] = val
+                total = total + config.train.coordinate_loss_weight * coord_losses['total']
+
+            if use_full:
+                full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
+                pred_full = model.render_frame(input_frames, input_times, target_time, mode=full_mode)
+                full_losses = criterion(pred_full, target_frame, compute_all=True)
+                for name, val in full_losses.items():
+                    losses[f"full_{name}"] = val
+                total = total + config.train.full_image_loss_weight * full_losses['total']
+
+            losses['total'] = total
 
         # Backward pass
         scaler.scale(losses['total']).backward()
@@ -329,14 +395,19 @@ def train_epoch_advanced(model: SPACE,
                 total_losses[name] += val.item()
             elif name != '_weights':
                 total_losses[name] += val
+        if use_full and pred_full is not None:
+            mse = F.mse_loss(pred_full.float(), target_frame.float())
+        else:
+            mse = F.mse_loss(pred_rgb.float(), target_rgb.float())
+        total_psnr += (10 * torch.log10(1.0 / mse.clamp(min=1e-10))).item()
         num_batches += 1
 
         # Progress bar
         postfix = {'loss': f"{losses['total'].item():.4f}"}
-        if 'charbonnier' in losses:
-            postfix['charb'] = f"{losses['charbonnier'].item():.4f}"
-        if 'anchor_distill' in losses:
-            postfix['anchor'] = f"{losses['anchor_distill'].item():.4f}"
+        if 'coord_charbonnier' in losses:
+            postfix['charb'] = f"{losses['coord_charbonnier'].item():.4f}"
+        if 'coord_anchor_distill' in losses:
+            postfix['anchor'] = f"{losses['coord_anchor_distill'].item():.4f}"
         pbar.set_postfix(postfix)
 
         # Tensorboard logging
@@ -360,10 +431,11 @@ def train_epoch_advanced(model: SPACE,
             batch_idx % config.train.full_frame_every == 0):
 
             with torch.no_grad():
+                full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
                 pred_frame = model.render_frame(
                     input_frames, input_times,
                     target_time=target_time[0].item(),
-                    mode='fast'
+                    mode=full_mode
                 )
                 full_losses = criterion(pred_frame, target_frame, compute_all=True)
 
@@ -372,7 +444,10 @@ def train_epoch_advanced(model: SPACE,
                         if isinstance(val, torch.Tensor) and name != 'total':
                             writer.add_scalar(f'train_ff/{name}', val.item(), global_step)
 
-    return {name: val / num_batches for name, val in total_losses.items()}
+    metrics = {name: val / max(num_batches, 1) for name, val in total_losses.items()}
+    metrics['loss'] = metrics.get('total', 0.0)
+    metrics['psnr'] = total_psnr / max(num_batches, 1)
+    return metrics
 
 
 @torch.no_grad()
@@ -403,12 +478,12 @@ def validate(model: SPACE,
 
         B, _, H, W = target_frame.shape
 
-        # Render full frame (use fast mode for validation speed)
-        # Output resolution matches input (no super-resolution)
+        # Render full frame (prefer NAFNet if available)
+        full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
         pred_frame = model.render_frame(
             input_frames, input_times,
             target_time=target_time_val,
-            mode='fast'
+            mode=full_mode
         )
 
         # Compute losses (full image mode)
@@ -534,10 +609,23 @@ def main():
     # Create model
     print("Creating model...")
     model = create_model(config)
+
+    # Enable gradient checkpointing
+    if config.train.use_gradient_checkpointing:
+        model.set_gradient_checkpointing(True)
+        print("  Gradient checkpointing: enabled")
+
     model = model.to(config.train.device)
 
+    # Apply torch.compile
+    if config.train.use_compile:
+        print(f"  Compiling model with mode='{config.train.compile_mode}'...")
+        model = torch.compile(model, mode=config.train.compile_mode)
+        print("  Model compiled successfully")
+
     # Print model info
-    param_counts = model.get_param_count()
+    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    param_counts = base_model.get_param_count()
     print(f"Model parameters: {param_counts['total']:,}")
     for name, count in param_counts.items():
         if name != 'total':
@@ -563,6 +651,7 @@ def main():
     else:
         criterion = SPACELoss(
             charbonnier_weight=config.train.charbonnier_weight,
+            charbonnier_eps=config.train.charbonnier_eps,
             ssim_weight=config.train.ssim_weight,
             perceptual_weight=config.train.perceptual_weight,
             frequency_weight=config.train.frequency_weight,

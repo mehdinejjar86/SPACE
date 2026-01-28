@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from typing import List, Tuple
 
 
@@ -99,15 +100,18 @@ class ConvNeXtEncoder(nn.Module):
                  in_channels: int = 3,
                  dims: List[int] = None,
                  depths: List[int] = None,
-                 drop_path_rate: float = 0.1):
+                 drop_path_rate: float = 0.1,
+                 use_gradient_checkpointing: bool = False):
         """
         Args:
             in_channels: Input image channels
             dims: Channel dimensions for each stage [96, 192, 384, 768]
             depths: Number of blocks per stage [3, 3, 9, 3]
             drop_path_rate: Stochastic depth rate
+            use_gradient_checkpointing: Use gradient checkpointing to save memory
         """
         super().__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         if dims is None:
             dims = [96, 192, 384, 768]
@@ -177,13 +181,20 @@ class ConvNeXtEncoder(nn.Module):
         x = self.stem(x)
 
         for i, stage in enumerate(self.stages):
-            x = stage(x)
+            if self.use_gradient_checkpointing and self.training:
+                x = checkpoint(stage, x, use_reentrant=False)
+            else:
+                x = stage(x)
             features.append(x)
 
             if i < len(self.downsamples):
                 x = self.downsamples[i](x)
 
         return features
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing."""
+        self.use_gradient_checkpointing = enable
 
     def forward_single_scale(self, x: torch.Tensor) -> torch.Tensor:
         """Get only the final scale feature (for backward compatibility)."""
@@ -201,7 +212,8 @@ class MultiScaleFrameEncoder(nn.Module):
     def __init__(self,
                  dims: List[int] = None,
                  depths: List[int] = None,
-                 drop_path_rate: float = 0.1):
+                 drop_path_rate: float = 0.1,
+                 use_gradient_checkpointing: bool = False):
         super().__init__()
 
         if dims is None:
@@ -214,8 +226,13 @@ class MultiScaleFrameEncoder(nn.Module):
             dims=dims,
             depths=depths,
             drop_path_rate=drop_path_rate,
+            use_gradient_checkpointing=use_gradient_checkpointing,
         )
         self.dims = dims
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing."""
+        self.encoder.set_gradient_checkpointing(enable)
 
     def forward(self, frames: torch.Tensor) -> List[torch.Tensor]:
         """
@@ -257,7 +274,8 @@ class FrameEncoderX(nn.Module):
     def __init__(self,
                  latent_dim: int = 256,
                  dims: List[int] = None,
-                 depths: List[int] = None):
+                 depths: List[int] = None,
+                 use_gradient_checkpointing: bool = False):
         super().__init__()
 
         if dims is None:
@@ -265,8 +283,14 @@ class FrameEncoderX(nn.Module):
         if depths is None:
             depths = [2, 2, 6, 2]
 
-        self.multi_scale_encoder = MultiScaleFrameEncoder(dims, depths)
+        self.multi_scale_encoder = MultiScaleFrameEncoder(
+            dims, depths, use_gradient_checkpointing=use_gradient_checkpointing
+        )
         self.dims = dims
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing."""
+        self.multi_scale_encoder.set_gradient_checkpointing(enable)
 
         # Global pooling + projection for latent vector
         self.global_pool = nn.AdaptiveAvgPool2d(1)

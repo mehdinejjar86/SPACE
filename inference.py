@@ -24,7 +24,18 @@ def load_model(checkpoint_path: str, device: str = 'cuda') -> SPACE:
 
     # Check if using preset
     if model_config.get('preset'):
-        model = build_space(model_config['preset'])
+        model = build_space(
+            model_config['preset'],
+            use_feature_grids=model_config.get('use_feature_grids', True),
+            use_fast_decoder=model_config.get('use_fast_decoder', False),
+            use_refinement=model_config.get('use_refinement', False),
+            refinement_hidden_dim=model_config.get('refinement_hidden_dim', 64),
+            refinement_num_blocks=model_config.get('refinement_num_blocks', 4),
+            use_nafnet_decoder=model_config.get('use_nafnet_decoder', True),
+            nafnet_hidden_dim=model_config.get('nafnet_hidden_dim', 64),
+            nafnet_num_blocks=model_config.get('nafnet_num_blocks', [2, 2, 4, 4]),
+            nafnet_use_modulation=model_config.get('nafnet_use_modulation', True),
+        )
     else:
         model = SPACE(
             encoder_dims=model_config.get('encoder_dims', [64, 128, 256, 512]),
@@ -35,7 +46,14 @@ def load_model(checkpoint_path: str, device: str = 'cuda') -> SPACE:
             num_siren_layers=model_config.get('num_siren_layers', 4),
             omega_0=model_config.get('omega_0', 30.0),
             use_feature_grids=model_config.get('use_feature_grids', True),
-            use_fast_decoder=model_config.get('use_fast_decoder', True),
+            use_fast_decoder=model_config.get('use_fast_decoder', False),
+            use_refinement=model_config.get('use_refinement', False),
+            refinement_hidden_dim=model_config.get('refinement_hidden_dim', 64),
+            refinement_num_blocks=model_config.get('refinement_num_blocks', 4),
+            use_nafnet_decoder=model_config.get('use_nafnet_decoder', True),
+            nafnet_hidden_dim=model_config.get('nafnet_hidden_dim', 64),
+            nafnet_num_blocks=model_config.get('nafnet_num_blocks', [2, 2, 4, 4]),
+            nafnet_use_modulation=model_config.get('nafnet_use_modulation', True),
         )
 
     model.load_state_dict(checkpoint['model_state_dict'])

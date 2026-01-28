@@ -74,7 +74,18 @@ def create_model(config) -> SPACE:
     """Create SPACE model from config."""
     model_config = config.model
     if model_config.preset:
-        return build_space(model_config.preset)
+        return build_space(
+            model_config.preset,
+            use_feature_grids=model_config.use_feature_grids,
+            use_fast_decoder=model_config.use_fast_decoder,
+            use_refinement=model_config.use_refinement,
+            refinement_hidden_dim=model_config.refinement_hidden_dim,
+            refinement_num_blocks=model_config.refinement_num_blocks,
+            use_nafnet_decoder=model_config.use_nafnet_decoder,
+            nafnet_hidden_dim=model_config.nafnet_hidden_dim,
+            nafnet_num_blocks=model_config.nafnet_num_blocks,
+            nafnet_use_modulation=model_config.nafnet_use_modulation,
+        )
     return SPACE(
         encoder_dims=model_config.encoder_dims,
         encoder_depths=model_config.encoder_depths,
@@ -85,6 +96,13 @@ def create_model(config) -> SPACE:
         omega_0=model_config.omega_0,
         use_feature_grids=model_config.use_feature_grids,
         use_fast_decoder=model_config.use_fast_decoder,
+        use_refinement=model_config.use_refinement,
+        refinement_hidden_dim=model_config.refinement_hidden_dim,
+        refinement_num_blocks=model_config.refinement_num_blocks,
+        use_nafnet_decoder=model_config.use_nafnet_decoder,
+        nafnet_hidden_dim=model_config.nafnet_hidden_dim,
+        nafnet_num_blocks=model_config.nafnet_num_blocks,
+        nafnet_use_modulation=model_config.nafnet_use_modulation,
     )
 
 
@@ -446,6 +464,10 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process())
 
+    training_mode = getattr(config.train, 'training_mode', 'coordinate')
+    use_inr = training_mode in ("coordinate", "hybrid")
+    use_full = training_mode in ("full_image", "hybrid")
+
     for batch_idx, batch in enumerate(pbar):
         if len(batch) == 5:
             input_frames, input_times, target_time, target_frame, dataset_name = batch
@@ -462,29 +484,52 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
         else:
             target_time = target_time.to(rank)
 
-        coords, target_rgb = sample_coordinates(
-            target_frame, config.train.num_samples, target_time
-        )
-
         optimizer.zero_grad()
 
         amp_dtype = torch.bfloat16 if config.train.amp_dtype == "bfloat16" else torch.float16
         with amp.autocast(device_type='cuda', enabled=config.train.use_amp, dtype=amp_dtype):
-            pred_rgb = model(input_frames, input_times, coords)
+            total_loss = torch.tensor(0.0, device=rank)
+            losses = {}
+            pred_full = None
+            pred_rgb = None
 
-            # Compute loss
-            if hasattr(criterion, 'uncertainty'):
-                losses = criterion(
-                    pred_rgb, target_rgb,
-                    model=model,
-                    input_frames=input_frames,
-                    input_times=input_times,
-                    compute_all=False
+            if use_inr:
+                coords, target_rgb = sample_coordinates(
+                    target_frame, config.train.num_samples, target_time
                 )
-            else:
-                losses = criterion(pred_rgb, target_rgb, compute_all=False)
+                pred_rgb = model(input_frames, input_times, coords)
 
-        mse = F.mse_loss(pred_rgb.float(), target_rgb.float())
+                # Compute coordinate loss
+                if hasattr(criterion, 'uncertainty'):
+                    coord_losses = criterion(
+                        pred_rgb, target_rgb,
+                        model=model,
+                        input_frames=input_frames,
+                        input_times=input_times,
+                        compute_all=False
+                    )
+                else:
+                    coord_losses = criterion(pred_rgb, target_rgb, compute_all=False)
+
+                for name, val in coord_losses.items():
+                    losses[f"coord_{name}"] = val
+                total_loss = total_loss + config.train.coordinate_loss_weight * coord_losses['total']
+
+            if use_full:
+                net = model.module if hasattr(model, 'module') else model
+                full_mode = 'nafnet' if getattr(net, 'use_nafnet_decoder', False) else 'fast'
+                pred_full = net.render_frame(input_frames, input_times, target_time, mode=full_mode)
+                full_losses = criterion(pred_full, target_frame, compute_all=True)
+                for name, val in full_losses.items():
+                    losses[f"full_{name}"] = val
+                total_loss = total_loss + config.train.full_image_loss_weight * full_losses['total']
+
+            losses['total'] = total_loss
+
+        if use_full and pred_full is not None:
+            mse = F.mse_loss(pred_full.float(), target_frame.float())
+        else:
+            mse = F.mse_loss(pred_rgb.float(), target_rgb.float())
         psnr = 10 * torch.log10(1.0 / mse.clamp(min=1e-10))
 
         scaler.scale(losses['total']).backward()
@@ -514,8 +559,8 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
                 'loss': f"{losses['total'].item():.4f}",
                 'psnr': f"{psnr.item():.2f}",
             }
-            if 'charbonnier' in losses:
-                postfix['charb'] = f"{losses['charbonnier'].item():.4f}"
+            if 'coord_charbonnier' in losses:
+                postfix['charb'] = f"{losses['coord_charbonnier'].item():.4f}"
             pbar.set_postfix(postfix)
 
         # Tensorboard logging
@@ -529,6 +574,7 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
             writer.add_scalar(f"train/{dataset_name}_loss", losses['total'].item(), global_step)
 
     metrics = {name: val / max(total_samples, 1) for name, val in total_losses.items()}
+    metrics['loss'] = metrics.get('total', 0.0)
     metrics['psnr'] = total_psnr / max(total_samples, 1)
     metrics['datasets'] = {}
     for name, ds in dataset_totals.items():
@@ -568,14 +614,12 @@ def validate_dataset(model, dataloader, criterion, dataset_name: str, rank: int,
         B = target_frame.shape[0]
 
         # Render full frame
-        pred_frame = model.module.render_frame(
+        net = model.module if hasattr(model, 'module') else model
+        full_mode = 'nafnet' if getattr(net, 'use_nafnet_decoder', False) else 'fast'
+        pred_frame = net.render_frame(
             input_frames, input_times,
             target_time=target_time_val,
-            mode='fast'
-        ) if hasattr(model, 'module') else model.render_frame(
-            input_frames, input_times,
-            target_time=target_time_val,
-            mode='fast'
+            mode=full_mode
         )
 
         # Compute losses
@@ -793,10 +837,11 @@ def _predict_with_anchors(model, anchor_frames, anchor_indices, target_idx, devi
     target_time = (target_idx - first_idx) / (last_idx - first_idx)
 
     # Predict
+    full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
     pred = model.render_frame(
         frames, anchor_times,
         target_time=target_time,
-        mode='fast'
+        mode=full_mode
     )
 
     return pred
@@ -1005,6 +1050,18 @@ def main_worker(rank: int, world_size: int, args):
                 f"x4k_steps ({len(config.data.x4k_steps)})"
             )
 
+    # Optimization options
+    if getattr(args, 'compile', False):
+        config.train.use_compile = True
+    if getattr(args, 'compile_mode', None):
+        config.train.compile_mode = args.compile_mode
+    if getattr(args, 'gradient_checkpointing', False):
+        config.train.use_gradient_checkpointing = True
+
+    # Model options
+    if getattr(args, 'refinement', False):
+        config.model.use_refinement = True
+
     set_seed(config.train.seed, rank)
 
     # Create output directories (only on main process)
@@ -1031,16 +1088,42 @@ def main_worker(rank: int, world_size: int, args):
     if is_main_process():
         print("\nCreating model...")
     model = create_model(config)
+
+    # Enable gradient checkpointing (before moving to GPU for memory savings)
+    if config.train.use_gradient_checkpointing:
+        model.set_gradient_checkpointing(True)
+        if is_main_process():
+            print("  Gradient checkpointing: enabled")
+
     model = model.to(rank)
 
+    # Apply torch.compile (before DDP for best results)
+    if config.train.use_compile:
+        if is_main_process():
+            print(f"  Compiling model with mode='{config.train.compile_mode}'...")
+        model = torch.compile(model, mode=config.train.compile_mode)
+        if is_main_process():
+            print("  Model compiled successfully")
+
     if world_size > 1:
-        # fast_decoder params aren't used in the coordinate-query training path,
-        # so enable unused-parameter detection when it's present.
-        find_unused = bool(config.model.use_fast_decoder)
+        training_mode = getattr(config.train, 'training_mode', 'coordinate')
+        use_inr = training_mode in ("coordinate", "hybrid")
+        use_full = training_mode in ("full_image", "hybrid")
+        uses_nafnet = use_full and config.model.use_nafnet_decoder
+        uses_fast = use_full and (not config.model.use_nafnet_decoder) and config.model.use_fast_decoder
+        # Any optional decoder that isn't exercised this run will be unused.
+        find_unused = (
+            (not use_inr) or
+            (config.model.use_fast_decoder and not uses_fast) or
+            (config.model.use_nafnet_decoder and not uses_nafnet)
+        )
         model = DDP(model, device_ids=[rank], find_unused_parameters=find_unused)
 
     if is_main_process():
         base_model = model.module if hasattr(model, 'module') else model
+        # Handle compiled model wrapper
+        if hasattr(base_model, '_orig_mod'):
+            base_model = base_model._orig_mod
         param_counts = base_model.get_param_count()
         print(f"Model parameters: {param_counts['total']:,}")
 
@@ -1070,6 +1153,7 @@ def main_worker(rank: int, world_size: int, args):
             print("  Using SPACELoss")
         criterion = SPACELoss(
             charbonnier_weight=config.train.charbonnier_weight,
+            charbonnier_eps=config.train.charbonnier_eps,
             ssim_weight=config.train.ssim_weight,
             perceptual_weight=config.train.perceptual_weight,
             frequency_weight=config.train.frequency_weight,
@@ -1272,6 +1356,18 @@ def main():
     parser.add_argument('--batch-size', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--resume', type=str, default=None, help="Checkpoint to resume from")
+
+    # Optimization
+    parser.add_argument('--compile', action='store_true', help="Use torch.compile()")
+    parser.add_argument('--compile-mode', type=str, default=None,
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help="torch.compile mode (default: reduce-overhead)")
+    parser.add_argument('--gradient-checkpointing', action='store_true',
+                        help="Enable gradient checkpointing to reduce memory")
+
+    # Coarse-to-Fine Refinement
+    parser.add_argument('--refinement', action='store_true',
+                        help="Enable coarse-to-fine refinement module")
 
     # DDP
     parser.add_argument('--gpus', type=int, default=None,

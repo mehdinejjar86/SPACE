@@ -261,6 +261,7 @@ class SPACELoss(nn.Module):
 
     def __init__(self,
                  charbonnier_weight: float = 1.0,
+                 charbonnier_eps: float = 1e-3,
                  ssim_weight: float = 0.5,
                  perceptual_weight: float = 0.1,
                  frequency_weight: float = 0.1,
@@ -272,7 +273,7 @@ class SPACELoss(nn.Module):
         self.perceptual_weight = perceptual_weight
         self.frequency_weight = frequency_weight
 
-        self.charbonnier = CharbonnierLoss()
+        self.charbonnier = CharbonnierLoss(eps=charbonnier_eps)
         self.ssim = SSIMLoss()
         self.frequency = FrequencyLoss()
 

@@ -9,6 +9,7 @@ from .encoder_x import FrameEncoderX, ConvNeXtEncoder
 from .aggregator_x import TemporalAggregatorX
 from .decoder_x import HybridDecoder, UpsampleDecoder, FourierFeatures
 from .bias_generator import BiasGenerator
+from .refinement import RefinementModule, CoarseToFineDecoder
 
 # Loss functions (original)
 from .loss_x import SPACELoss, VGGPerceptualLoss, CharbonnierLoss, SSIMLoss, FrequencyLoss
@@ -40,6 +41,9 @@ __all__ = [
     'FourierFeatures',
     # Bias generator
     'BiasGenerator',
+    # Refinement
+    'RefinementModule',
+    'CoarseToFineDecoder',
     # Original losses
     'SPACELoss',
     'VGGPerceptualLoss',

@@ -12,6 +12,8 @@ from .encoder_x import FrameEncoderX
 from .aggregator_x import TemporalAggregatorX
 from .decoder_x import HybridDecoder, UpsampleDecoder
 from .bias_generator import BiasGenerator
+from .refinement import RefinementModule
+from .nafnet_decoder import NAFNetDecoder
 
 
 class SPACE(nn.Module):
@@ -65,7 +67,19 @@ class SPACE(nn.Module):
 
                  # Features
                  use_feature_grids: bool = True,
-                 use_fast_decoder: bool = True):
+                 use_fast_decoder: bool = True,
+                 use_gradient_checkpointing: bool = False,
+
+                 # Coarse-to-Fine Refinement
+                 use_refinement: bool = False,
+                 refinement_hidden_dim: int = 64,
+                 refinement_num_blocks: int = 4,
+
+                 # NAFNet-style decoder (alternative to fast_decoder)
+                 use_nafnet_decoder: bool = False,
+                 nafnet_hidden_dim: int = 64,
+                 nafnet_num_blocks: List[int] = None,
+                 nafnet_use_modulation: bool = True):
         """
         Args:
             encoder_dims: ConvNeXt channel dims per stage [64, 128, 256, 512]
@@ -77,6 +91,14 @@ class SPACE(nn.Module):
             omega_0: SIREN frequency scaling
             use_feature_grids: Output spatial feature grids from aggregator
             use_fast_decoder: Include CNN upsampler for fast rendering
+            use_gradient_checkpointing: Use gradient checkpointing to save memory
+            use_refinement: Use coarse-to-fine refinement module
+            refinement_hidden_dim: Hidden dimension for refinement network
+            refinement_num_blocks: Number of residual blocks in refinement
+            use_nafnet_decoder: Use NAFNet-style decoder (replaces fast_decoder)
+            nafnet_hidden_dim: NAFNet decoder hidden dimension
+            nafnet_num_blocks: NAFNet blocks per level [2, 2, 4, 4]
+            nafnet_use_modulation: Apply scene/time-conditioned modulation in NAFNet
         """
         super().__init__()
 
@@ -84,17 +106,23 @@ class SPACE(nn.Module):
             encoder_dims = [64, 128, 256, 512]
         if encoder_depths is None:
             encoder_depths = [2, 2, 6, 2]
+        if nafnet_num_blocks is None:
+            nafnet_num_blocks = [2, 2, 4, 4]
 
         self.encoder_dims = encoder_dims
         self.latent_dim = latent_dim
         self.use_feature_grids = use_feature_grids
         self.use_fast_decoder = use_fast_decoder
+        self.use_refinement = use_refinement
+        self.use_nafnet_decoder = use_nafnet_decoder
+        self.nafnet_use_modulation = nafnet_use_modulation
 
         # 1. Multi-scale Frame Encoder (ConvNeXt)
         self.encoder = FrameEncoderX(
             latent_dim=latent_dim,
             dims=encoder_dims,
             depths=encoder_depths,
+            use_gradient_checkpointing=use_gradient_checkpointing,
         )
 
         # 2. Multi-scale Temporal Aggregator
@@ -126,6 +154,23 @@ class SPACE(nn.Module):
             self.fast_decoder = UpsampleDecoder(
                 feature_dims=encoder_dims,
                 hidden_dim=hidden_dim,
+            )
+
+        # 6. Coarse-to-Fine Refinement (optional)
+        if use_refinement:
+            self.refinement = RefinementModule(
+                feature_dims=encoder_dims,
+                hidden_dim=refinement_hidden_dim,
+                num_res_blocks=refinement_num_blocks,
+            )
+
+        # 7. NAFNet-style Decoder (optional, alternative to fast_decoder)
+        if use_nafnet_decoder:
+            self.nafnet_decoder = NAFNetDecoder(
+                feature_dims=encoder_dims,
+                hidden_dim=nafnet_hidden_dim,
+                num_blocks=nafnet_num_blocks,
+                mod_dim=latent_dim if nafnet_use_modulation else None,
             )
 
     def encode(self,
@@ -224,16 +269,19 @@ class SPACE(nn.Module):
         H, W = frames.shape[3], frames.shape[4]
 
         if mode == 'auto':
-            # Use fast decoder for large images, HQ for small
-            if H * W > 256 * 256:
+            # Prefer NAFNet if available; otherwise fast for large, HQ for small
+            if self.use_nafnet_decoder:
+                mode = 'nafnet'
+            elif H * W > 256 * 256:
                 mode = 'fast'
             else:
                 mode = 'hq'
 
+        if mode == 'nafnet' and self.use_nafnet_decoder:
+            return self._render_nafnet(frames, frame_times, target_time)
         if mode == 'fast' and self.use_fast_decoder:
             return self._render_fast(frames, frame_times, target_time)
-        else:
-            return self._render_hq(frames, frame_times, target_time)
+        return self._render_hq(frames, frame_times, target_time)
 
     def _render_hq(self,
                    frames: torch.Tensor,
@@ -245,7 +293,15 @@ class SPACE(nn.Module):
         device = frames.device
 
         # Encode
-        query_time = torch.full((B, 1), target_time, device=device)
+        if isinstance(target_time, (int, float)):
+            query_time = torch.full((B, 1), target_time, device=device)
+            t_vals = torch.full((B, H * W), target_time, device=device)
+        else:
+            t = target_time.to(device)
+            if t.dim() == 2:
+                t = t.squeeze(1)
+            query_time = t.unsqueeze(1)
+            t_vals = t.view(B, 1).expand(B, H * W)
         encoding = self.encode(frames, frame_times, query_time)
 
         # Create coordinate grid at input resolution
@@ -256,7 +312,7 @@ class SPACE(nn.Module):
         coords = torch.stack([
             xx.flatten().unsqueeze(0).expand(B, -1),
             yy.flatten().unsqueeze(0).expand(B, -1),
-            torch.full((B, H * W), target_time, device=device),
+            t_vals,
         ], dim=-1)
 
         # Decode
@@ -264,11 +320,39 @@ class SPACE(nn.Module):
 
         return rgb.view(B, H, W, 3).permute(0, 3, 1, 2)
 
+    def _render_nafnet(self,
+                       frames: torch.Tensor,
+                       frame_times: torch.Tensor,
+                       target_time: float) -> torch.Tensor:
+        """Full-frame rendering using NAFNet-style decoder."""
+        if not self.use_nafnet_decoder:
+            return self._render_fast(frames, frame_times, target_time)
+
+        B = frames.shape[0]
+        H, W = frames.shape[3], frames.shape[4]
+        device = frames.device
+
+        if isinstance(target_time, (int, float)):
+            query_time = torch.full((B, 1), target_time, device=device)
+        else:
+            t = target_time.to(device)
+            if t.dim() == 2:
+                t = t.squeeze(1)
+            query_time = t.unsqueeze(1)
+
+        encoding = self.encode(frames, frame_times, query_time)
+        pred = self.nafnet_decoder(encoding['feature_grids'], encoding['scene_code'])
+
+        if pred.shape[2:] != (H, W):
+            pred = F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=True)
+        return pred
+
     def _render_fast(self,
                      frames: torch.Tensor,
                      frame_times: torch.Tensor,
-                     target_time: float) -> torch.Tensor:
-        """Fast rendering using CNN upsampler."""
+                     target_time: float,
+                     return_coarse: bool = False) -> torch.Tensor:
+        """Fast rendering using CNN upsampler with optional refinement."""
         if not self.use_fast_decoder:
             return self._render_hq(frames, frame_times, target_time)
 
@@ -277,18 +361,42 @@ class SPACE(nn.Module):
         device = frames.device
 
         # Encode
-        query_time = torch.full((B, 1), target_time, device=device)
+        if isinstance(target_time, (int, float)):
+            query_time = torch.full((B, 1), target_time, device=device)
+        else:
+            t = target_time.to(device)
+            if t.dim() == 2:
+                t = t.squeeze(1)
+            query_time = t.unsqueeze(1)
         encoding = self.encode(frames, frame_times, query_time)
 
-        # Use CNN decoder on feature grids
-        output = self.fast_decoder(encoding['feature_grids'])
+        # Use CNN decoder on feature grids (coarse prediction)
+        coarse = self.fast_decoder(encoding['feature_grids'])
 
         # Resize to input resolution
-        if output.shape[2] != H or output.shape[3] != W:
-            output = F.interpolate(output, size=(H, W),
+        if coarse.shape[2] != H or coarse.shape[3] != W:
+            coarse = F.interpolate(coarse, size=(H, W),
                                    mode='bilinear', align_corners=True)
 
-        return output
+        # Apply refinement if enabled
+        if self.use_refinement:
+            # Resize feature grids to match output resolution for refinement
+            feature_grids_resized = []
+            for feat in encoding['feature_grids']:
+                if feat.shape[2:] != (H, W):
+                    feat = F.interpolate(feat, size=(H, W),
+                                         mode='bilinear', align_corners=True)
+                feature_grids_resized.append(feat)
+
+            refined = self.refinement(coarse, feature_grids_resized)
+
+            if return_coarse:
+                return refined, coarse
+            return refined
+
+        if return_coarse:
+            return coarse, coarse
+        return coarse
 
     def render_frame_chunked(self,
                              frames: torch.Tensor,
@@ -373,11 +481,19 @@ class SPACE(nn.Module):
         }
         if self.use_fast_decoder:
             counts['fast_decoder'] = sum(p.numel() for p in self.fast_decoder.parameters())
+        if self.use_nafnet_decoder:
+            counts['nafnet_decoder'] = sum(p.numel() for p in self.nafnet_decoder.parameters())
+        if self.use_refinement:
+            counts['refinement'] = sum(p.numel() for p in self.refinement.parameters())
         counts['total'] = sum(counts.values())
         return counts
 
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing."""
+        self.encoder.set_gradient_checkpointing(enable)
 
-def build_space(config: str = 'base') -> SPACE:
+
+def build_space(config: str = 'base', **overrides) -> SPACE:
     """
     Build SPACE model from preset config.
 
@@ -393,6 +509,8 @@ def build_space(config: str = 'base') -> SPACE:
             'latent_dim': 128,
             'hidden_dim': 128,
             'num_siren_layers': 3,
+            'use_fast_decoder': False,
+            'use_nafnet_decoder': True,
         },
         'base': {
             'encoder_dims': [64, 128, 256, 512],
@@ -400,6 +518,8 @@ def build_space(config: str = 'base') -> SPACE:
             'latent_dim': 256,
             'hidden_dim': 256,
             'num_siren_layers': 4,
+            'use_fast_decoder': False,
+            'use_nafnet_decoder': True,
         },
         'large': {
             'encoder_dims': [96, 192, 384, 768],
@@ -407,7 +527,11 @@ def build_space(config: str = 'base') -> SPACE:
             'latent_dim': 384,
             'hidden_dim': 384,
             'num_siren_layers': 5,
+            'use_fast_decoder': False,
+            'use_nafnet_decoder': True,
         },
     }
 
-    return SPACE(**configs.get(config, configs['base']))
+    cfg = configs.get(config, configs['base']).copy()
+    cfg.update(overrides)
+    return SPACE(**cfg)

@@ -27,7 +27,19 @@ class ModelConfig:
 
     # Features
     use_feature_grids: bool = True
-    use_fast_decoder: bool = True
+    use_fast_decoder: bool = False
+
+    # Coarse-to-Fine Refinement
+    use_refinement: bool = False
+    refinement_hidden_dim: int = 64
+    refinement_num_blocks: int = 4
+    refinement_iterations: int = 1
+
+    # NAFNet-style decoder (alternative to fast_decoder)
+    use_nafnet_decoder: bool = True
+    nafnet_hidden_dim: int = 64
+    nafnet_num_blocks: List[int] = field(default_factory=lambda: [2, 2, 4, 4])
+    nafnet_use_modulation: bool = True
 
     # Preset config (overrides above if set)
     preset: Optional[str] = None  # 'tiny', 'base', 'large'
@@ -89,12 +101,18 @@ class TrainConfig:
     warmup_epochs: int = 5
     min_lr: float = 1e-6
 
-    # Coordinate sampling for INR training
+    # Training mode
+    training_mode: str = "hybrid"  # "coordinate" (INR), "full_image" (NAFNet), "hybrid" (both)
+    coordinate_loss_weight: float = 1.0
+    full_image_loss_weight: float = 1.0
+
+    # Coordinate sampling for INR training (only used when training_mode="coordinate")
     num_samples: int = 4096  # Coordinates per image per batch
     sample_strategy: str = "random"  # "random", "grid", "importance"
 
     # Loss weights (for SPACELoss - original)
     charbonnier_weight: float = 1.0
+    charbonnier_eps: float = 1e-3  # Epsilon for Charbonnier loss (1e-3 better for PSNR than 1e-6)
     ssim_weight: float = 0.5
     perceptual_weight: float = 0.1
     frequency_weight: float = 0.1
@@ -132,6 +150,11 @@ class TrainConfig:
     # Mixed precision
     use_amp: bool = True
     amp_dtype: str = "bfloat16"  # "float16", "bfloat16"
+
+    # Optimization
+    use_compile: bool = False  # torch.compile() for faster training
+    compile_mode: str = "reduce-overhead"  # "default", "reduce-overhead", "max-autotune"
+    use_gradient_checkpointing: bool = False  # Reduce memory at cost of speed
 
     # Checkpointing
     checkpoint_dir: str = "./checkpoints"
@@ -205,7 +228,7 @@ def get_tiny_config() -> Config:
     """Get tiny configuration for fast experimentation."""
     return Config(
         name="space_tiny",
-        model=ModelConfig(preset='tiny'),
+        model=ModelConfig(preset='tiny', use_nafnet_decoder=False, use_fast_decoder=True),
         data=DataConfig(
             crop_size=128,
             num_workers=2,
@@ -215,6 +238,7 @@ def get_tiny_config() -> Config:
             epochs=50,
             num_samples=1024,
             log_every=50,
+            training_mode="coordinate",
             # Disable heavy losses for speed
             use_lpips=False,
             use_laplacian=False,
