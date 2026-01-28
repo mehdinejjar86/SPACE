@@ -2,6 +2,7 @@
 # X4K1000 Dataset loader for SPACE with STEP-based sampling
 # Adapted from TEMPO with motion magnitude control and variable N per step
 
+import os
 import random
 from pathlib import Path
 from typing import Optional, List, Tuple, Union
@@ -10,6 +11,10 @@ import numpy as np
 import torch
 import torch.utils.data as data
 from PIL import Image
+
+
+def _is_main_process() -> bool:
+    return os.environ.get("SPACE_RANK", "0") == "0"
 
 
 class X4K1000Dataset(data.Dataset):
@@ -86,7 +91,8 @@ class X4K1000Dataset(data.Dataset):
 
         # Scan all sequences
         self.sequences = self._scan_sequences()
-        print(f"[X4K {split}] Found {len(self.sequences)} sequences")
+        if _is_main_process():
+            print(f"[X4K {split}] Found {len(self.sequences)} sequences")
 
         # Generate (sequence_idx, target_idx, anchors, n_frames) tuples
         self.samples = self._generate_samples()
@@ -94,7 +100,8 @@ class X4K1000Dataset(data.Dataset):
         # Group samples by n_frames for efficient batch sampling
         self._index_by_n_frames()
 
-        print(f"[X4K {split}] Generated {len(self.samples)} samples with (steps, n_frames)={list(zip(self.steps, self.n_frames_list))}")
+        if _is_main_process():
+            print(f"[X4K {split}] Generated {len(self.samples)} samples with (steps, n_frames)={list(zip(self.steps, self.n_frames_list))}")
 
     def _scan_sequences(self) -> List[str]:
         """Scan nested directory structure for 65-frame sequences."""
@@ -181,7 +188,8 @@ class X4K1000Dataset(data.Dataset):
                         step_samples += 1
 
             targets_per_window = window_span - 1 - (n_frames - 2)  # span - 1 minus interior anchors
-            print(f"  STEP={step}, N={n_frames}: {num_windows} windows × {targets_per_window} targets × {len(self.sequences)} seqs = {step_samples} samples")
+            if _is_main_process():
+                print(f"  STEP={step}, N={n_frames}: {num_windows} windows × {targets_per_window} targets × {len(self.sequences)} seqs = {step_samples} samples")
 
         return all_samples
 
@@ -196,7 +204,8 @@ class X4K1000Dataset(data.Dataset):
 
         # Print distribution
         for n, indices in sorted(self.samples_by_n.items()):
-            print(f"    N={n}: {len(indices)} samples")
+            if _is_main_process():
+                print(f"    N={n}: {len(indices)} samples")
 
     def get_n_frames_values(self) -> List[int]:
         """Get unique n_frames values in this dataset."""
@@ -497,11 +506,13 @@ class X4KTestDataset(data.Dataset):
 
         # Scan sequences
         self.sequences = self._scan_sequences()
-        print(f"[X4K Test] Found {len(self.sequences)} sequences")
+        if _is_main_process():
+            print(f"[X4K Test] Found {len(self.sequences)} sequences")
 
         # Generate samples
         self.samples = self._generate_samples()
-        print(f"[X4K Test] Generated {len(self.samples)} samples (targets: {self.target_indices})")
+        if _is_main_process():
+            print(f"[X4K Test] Generated {len(self.samples)} samples (targets: {self.target_indices})")
 
     def _scan_sequences(self) -> List[Tuple[str, str, str]]:
         """Scan Type1/2/3 directories for test sequences.
@@ -611,7 +622,8 @@ class X4KSequenceDataset(data.Dataset):
 
         # Scan sequences
         self.sequences = self._scan_sequences()
-        print(f"[X4K Sequence] Found {len(self.sequences)} sequences (scale={scale})")
+        if _is_main_process():
+            print(f"[X4K Sequence] Found {len(self.sequences)} sequences (scale={scale})")
 
     def _scan_sequences(self) -> List[Tuple[str, str, str]]:
         """Scan Type1/2/3 directories for test sequences."""

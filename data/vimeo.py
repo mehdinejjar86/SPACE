@@ -11,6 +11,10 @@ import torch.utils.data as data
 import torchvision.transforms as T
 from PIL import Image
 
+
+def _is_main_process() -> bool:
+    return os.environ.get("SPACE_RANK", "0") == "0"
+
 Mode = Literal["interp", "extrap_fwd", "extrap_bwd", "mix"]
 
 
@@ -74,7 +78,8 @@ class VimeoTriplet(data.Dataset):
 
         self.to_tensor = T.ToTensor()
 
-        print(f"[Vimeo {split}] Loaded {len(self.items)} sequences, mode={mode}")
+        if _is_main_process():
+            print(f"[Vimeo {split}] Loaded {len(self.items)} sequences, mode={mode}")
 
     def __len__(self) -> int:
         return len(self.items)

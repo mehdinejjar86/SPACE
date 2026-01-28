@@ -23,6 +23,7 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import save_image
 from tqdm import tqdm
 
 from model import SPACE, build_space, SPACELoss, AdvancedSPACELoss
@@ -248,10 +249,11 @@ class MixedDataLoaders:
                 if use_vimeo:
                     batch = next(vimeo_iter)
                     vimeo_remaining -= 1
+                    yield (*batch, "vimeo")
                 else:
                     batch = next(x4k_iter)
                     x4k_remaining -= 1
-                yield batch
+                    yield (*batch, "x4k")
             except StopIteration:
                 # One iterator exhausted, continue with the other
                 continue
@@ -437,11 +439,19 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
             print(f"  Active losses: {active_losses}")
 
     total_losses = defaultdict(float)
-    num_batches = 0
+    total_psnr = 0.0
+    total_samples = 0
+    dataset_totals = defaultdict(lambda: {'loss': 0.0, 'psnr': 0.0, 'samples': 0})
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process())
 
-    for batch_idx, (input_frames, input_times, target_time, target_frame) in enumerate(pbar):
+    for batch_idx, batch in enumerate(pbar):
+        if len(batch) == 5:
+            input_frames, input_times, target_time, target_frame, dataset_name = batch
+        else:
+            input_frames, input_times, target_time, target_frame = batch
+            dataset_name = "vimeo"
+
         input_frames = input_frames.to(rank)
         input_times = input_times.to(rank)
         target_frame = target_frame.to(rank)
@@ -473,6 +483,9 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
             else:
                 losses = criterion(pred_rgb, target_rgb, compute_all=False)
 
+        mse = F.mse_loss(pred_rgb.float(), target_rgb.float())
+        psnr = 10 * torch.log10(1.0 / mse.clamp(min=1e-10))
+
         scaler.scale(losses['total']).backward()
 
         if config.train.grad_clip > 0:
@@ -485,11 +498,18 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
         # Accumulate metrics
         for name, val in losses.items():
             if isinstance(val, torch.Tensor):
-                total_losses[name] += val.item()
-        num_batches += 1
+                total_losses[name] += val.item() * input_frames.shape[0]
+        total_psnr += psnr.item() * input_frames.shape[0]
+        total_samples += input_frames.shape[0]
+
+        ds = dataset_totals[dataset_name]
+        ds['loss'] += losses['total'].item() * input_frames.shape[0]
+        ds['psnr'] += psnr.item() * input_frames.shape[0]
+        ds['samples'] += input_frames.shape[0]
 
         if is_main_process():
             postfix = {'loss': f"{losses['total'].item():.4f}"}
+            postfix['psnr'] = f"{psnr.item():.2f}"
             if 'charbonnier' in losses:
                 postfix['charb'] = f"{losses['charbonnier'].item():.4f}"
             pbar.set_postfix(postfix)
@@ -500,12 +520,26 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
             for name, val in losses.items():
                 if isinstance(val, torch.Tensor):
                     writer.add_scalar(f'train/{name}', val.item(), global_step)
+            writer.add_scalar('train/psnr', psnr.item(), global_step)
+            writer.add_scalar(f"train/{dataset_name}_psnr", psnr.item(), global_step)
+            writer.add_scalar(f"train/{dataset_name}_loss", losses['total'].item(), global_step)
 
-    return {name: val / num_batches for name, val in total_losses.items()}
+    metrics = {name: val / max(total_samples, 1) for name, val in total_losses.items()}
+    metrics['psnr'] = total_psnr / max(total_samples, 1)
+    metrics['datasets'] = {}
+    for name, ds in dataset_totals.items():
+        if ds['samples'] == 0:
+            continue
+        metrics['datasets'][name] = {
+            'loss': ds['loss'] / ds['samples'],
+            'psnr': ds['psnr'] / ds['samples'],
+        }
+    return metrics
 
 
 @torch.no_grad()
-def validate_dataset(model, dataloader, criterion, dataset_name: str, rank: int, world_size: int):
+def validate_dataset(model, dataloader, criterion, dataset_name: str, rank: int, world_size: int,
+                     val_samples_dir: Path = None, save_samples: bool = False):
     """Validate on a single dataset."""
     model.eval()
 
@@ -513,6 +547,7 @@ def validate_dataset(model, dataloader, criterion, dataset_name: str, rank: int,
     total_ssim = 0
     total_loss = 0
     num_samples = 0
+    samples_saved = False
 
     for input_frames, input_times, target_time, target_frame in tqdm(
         dataloader, desc=f"Val {dataset_name}", disable=not is_main_process()
@@ -547,12 +582,25 @@ def validate_dataset(model, dataloader, criterion, dataset_name: str, rank: int,
         mse = F.mse_loss(pred_frame, target_frame)
         psnr = 10 * torch.log10(1.0 / mse.clamp(min=1e-10))
 
-        # SSIM
-        ssim = 1.0 - losses.get('ssim', losses.get('msssim', torch.tensor(0.5))).item()
+        # SSIM (standard gaussian-window SSIM)
+        ssim = _compute_ssim(pred_frame, target_frame)
 
         total_psnr += psnr.item() * B
         total_ssim += ssim * B
         num_samples += B
+
+        # Save a small set of validation samples (rank 0 only)
+        if save_samples and not samples_saved and is_main_process() and val_samples_dir is not None:
+            out_dir = val_samples_dir / dataset_name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # Save first sample: input frames, prediction, target
+            inp0 = input_frames[0, 0:1].clamp(0, 1)
+            inp1 = input_frames[0, 1:2].clamp(0, 1)
+            pred = pred_frame[0:1].clamp(0, 1)
+            tgt = target_frame[0:1].clamp(0, 1)
+            grid = torch.cat([inp0, inp1, pred, tgt], dim=0)
+            save_image(grid, out_dir / "sample_0.png", nrow=4)
+            samples_saved = True
 
     # Gather metrics across all GPUs
     if world_size > 1:
@@ -584,7 +632,8 @@ class InputPadder:
 
 
 @torch.no_grad()
-def validate_x4k_cascaded(model, dataloader, rank: int, world_size: int, scale: str = "4k"):
+def validate_x4k_cascaded(model, dataloader, rank: int, world_size: int, scale: str = "4k",
+                          val_samples_dir: Path = None, save_samples: bool = False):
     """
     Validate on X4K using cascaded 8x interpolation.
 
@@ -613,6 +662,8 @@ def validate_x4k_cascaded(model, dataloader, rank: int, world_size: int, scale: 
 
     all_psnr = []
     all_ssim = []
+
+    samples_saved = False
 
     for frame_0, frame_32, gt_frames_list, metadata in tqdm(
         dataloader, desc=f"Val X4K-{scale} (cascaded)", disable=not is_main_process()
@@ -680,6 +731,20 @@ def validate_x4k_cascaded(model, dataloader, rank: int, world_size: int, scale: 
 
             all_psnr.append(sum(seq_psnr) / len(seq_psnr))
             all_ssim.append(sum(seq_ssim) / len(seq_ssim))
+
+            if save_samples and not samples_saved and is_main_process() and val_samples_dir is not None:
+                out_dir = val_samples_dir / f"x4k_{scale}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                pred = predictions[16].clamp(0, 1)
+                gt = gt_frames[16].unsqueeze(0).to(device).clamp(0, 1)
+                grid = torch.cat([
+                    padder.unpad(f0_pad).clamp(0, 1),
+                    padder.unpad(f32_pad).clamp(0, 1),
+                    pred,
+                    gt,
+                ], dim=0)
+                save_image(grid, out_dir / "sample_0.png", nrow=4)
+                samples_saved = True
 
     # Gather metrics across GPUs
     if world_size > 1:
@@ -761,27 +826,44 @@ def _get_closest_anchors(available, target_idx, n=4):
     return sorted(selected)
 
 
-def _compute_ssim(pred, target):
-    """Simple SSIM approximation."""
-    import math
+def _compute_ssim(pred, target, window_size: int = 11, sigma: float = 1.5):
+    """Compute SSIM using a Gaussian window (expects inputs in [0, 1])."""
+    pred = pred.clamp(0, 1)
+    target = target.clamp(0, 1)
 
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
+    device = pred.device
+    dtype = pred.dtype
+    channels = pred.shape[1]
 
-    mu_pred = pred.mean()
-    mu_target = target.mean()
+    # Create Gaussian window
+    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = (g / g.sum()).view(1, 1, -1)
+    window = (g.transpose(2, 1) @ g).view(1, 1, window_size, window_size)
+    window = window.expand(channels, 1, window_size, window_size)
 
-    sigma_pred_sq = ((pred - mu_pred) ** 2).mean()
-    sigma_target_sq = ((target - mu_target) ** 2).mean()
-    sigma_pred_target = ((pred - mu_pred) * (target - mu_target)).mean()
+    mu1 = F.conv2d(pred, window, padding=window_size // 2, groups=channels)
+    mu2 = F.conv2d(target, window, padding=window_size // 2, groups=channels)
 
-    ssim = ((2 * mu_pred * mu_target + C1) * (2 * sigma_pred_target + C2)) / \
-           ((mu_pred ** 2 + mu_target ** 2 + C1) * (sigma_pred_sq + sigma_target_sq + C2))
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
 
-    return ssim.item()
+    sigma1_sq = F.conv2d(pred * pred, window, padding=window_size // 2, groups=channels) - mu1_sq
+    sigma2_sq = F.conv2d(target * target, window, padding=window_size // 2, groups=channels) - mu2_sq
+    sigma12 = F.conv2d(pred * target, window, padding=window_size // 2, groups=channels) - mu1_mu2
+
+    C1 = (0.01 ** 2)
+    C2 = (0.03 ** 2)
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    return ssim_map.mean().item()
 
 
-def validate_all(model, val_loaders, criterion, epoch, writer, rank, world_size):
+def validate_all(model, val_loaders, criterion, epoch, writer, rank, world_size,
+                 val_samples_dir: Path = None, save_samples: bool = False):
     """
     Validate on all datasets and compute average metrics.
 
@@ -799,10 +881,16 @@ def validate_all(model, val_loaders, criterion, epoch, writer, rank, world_size)
         # Use cascaded validation for X4K
         if name.startswith('x4k_'):
             scale = name.split('_')[1]  # '2k' or '4k'
-            metrics = validate_x4k_cascaded(model, loader, rank, world_size, scale=scale)
+            metrics = validate_x4k_cascaded(
+                model, loader, rank, world_size, scale=scale,
+                val_samples_dir=val_samples_dir, save_samples=save_samples
+            )
         else:
             # Standard validation for Vimeo
-            metrics = validate_dataset(model, loader, criterion, name, rank, world_size)
+            metrics = validate_dataset(
+                model, loader, criterion, name, rank, world_size,
+                val_samples_dir=val_samples_dir, save_samples=save_samples
+            )
 
         all_metrics[name] = metrics
         psnr_values.append(metrics['psnr'])
@@ -856,6 +944,7 @@ def main_worker(rank: int, world_size: int, args):
     # Setup DDP
     if world_size > 1:
         setup_ddp(rank, world_size)
+    os.environ["SPACE_RANK"] = str(rank)
 
     # Load config
     if args.config:
@@ -902,17 +991,22 @@ def main_worker(rank: int, world_size: int, args):
 
     # Create output directories (only on main process)
     if is_main_process():
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_name = f"{config.name}_{timestamp}"
-        checkpoint_dir = Path(config.train.checkpoint_dir) / run_name
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        run_root = Path("runs") / timestamp
+        checkpoint_dir = run_root / "checkpoints"
+        logs_dir = run_root / "logs"
+        val_samples_dir = run_root / "validation samples"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        config.save(checkpoint_dir / "config.json")
-        writer = SummaryWriter(checkpoint_dir / "logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        val_samples_dir.mkdir(parents=True, exist_ok=True)
+        config.save(run_root / "config.json")
+        writer = SummaryWriter(logs_dir)
         print(f"\n{'='*60}")
         print(f"SPACE DDP Training - {world_size} GPU(s)")
         print(f"{'='*60}")
     else:
         checkpoint_dir = None
+        val_samples_dir = None
         writer = None
 
     # Create model
@@ -1051,14 +1145,24 @@ def main_worker(rank: int, world_size: int, args):
             scheduler.step()
             if writer:
                 writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch)
+        if writer and 'datasets' in train_metrics:
+            for name, m in train_metrics['datasets'].items():
+                writer.add_scalar(f"train/{name}_epoch_loss", m['loss'], epoch)
+                writer.add_scalar(f"train/{name}_epoch_psnr", m['psnr'], epoch)
 
         # Validate on all datasets
         if epoch % config.train.val_every == 0 and val_loaders:
+            save_samples = (epoch % 10 == 0)
             val_metrics = validate_all(
-                model, val_loaders, criterion, epoch, writer, rank, world_size
+                model, val_loaders, criterion, epoch, writer, rank, world_size,
+                val_samples_dir=val_samples_dir, save_samples=save_samples
             )
 
             if is_main_process():
+                train_ds_strs = []
+                for name, m in train_metrics.get('datasets', {}).items():
+                    train_ds_strs.append(f"train_{name}: PSNR={m['psnr']:.2f}")
+
                 # Print per-dataset metrics
                 metric_strs = []
                 for name, m in val_metrics.items():
@@ -1066,6 +1170,8 @@ def main_worker(rank: int, world_size: int, args):
                         metric_strs.append(f"{name}: PSNR={m['psnr']:.2f}")
 
                 print(f"Epoch {epoch}: Loss={train_metrics['loss']:.4f}, "
+                      f"PSNR={train_metrics.get('psnr', 0):.2f}, "
+                      f"{', '.join(train_ds_strs)}, "
                       f"{', '.join(metric_strs)}, "
                       f"Avg PSNR={val_metrics['avg']['psnr']:.2f}")
 
@@ -1081,7 +1187,13 @@ def main_worker(rank: int, world_size: int, args):
                     print(f"  -> New best! Avg PSNR: {best_avg_psnr:.2f}")
         else:
             if is_main_process():
-                print(f"Epoch {epoch}: Loss={train_metrics['loss']:.4f}")
+                train_ds_strs = []
+                for name, m in train_metrics.get('datasets', {}).items():
+                    train_ds_strs.append(f"train_{name}: PSNR={m['psnr']:.2f}")
+
+                print(f"Epoch {epoch}: Loss={train_metrics['loss']:.4f}, "
+                      f"PSNR={train_metrics.get('psnr', 0):.2f}, "
+                      f"{', '.join(train_ds_strs)}")
 
         # Save periodic checkpoint
         if is_main_process() and epoch % config.train.save_every == 0:
