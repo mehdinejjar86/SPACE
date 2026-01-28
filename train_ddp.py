@@ -509,8 +509,11 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
         ds['samples'] += input_frames.shape[0]
 
         if is_main_process():
-            postfix = {'loss': f"{losses['total'].item():.4f}"}
-            postfix['psnr'] = f"{psnr.item():.2f}"
+            postfix = {
+                'ds': dataset_name,
+                'loss': f"{losses['total'].item():.4f}",
+                'psnr': f"{psnr.item():.2f}",
+            }
             if 'charbonnier' in losses:
                 postfix['charb'] = f"{losses['charbonnier'].item():.4f}"
             pbar.set_postfix(postfix)
@@ -726,7 +729,7 @@ def validate_x4k_cascaded(model, dataloader, rank: int, world_size: int, scale: 
                 psnr = 10 * torch.log10(1.0 / mse.clamp(min=1e-10))
                 seq_psnr.append(psnr.item())
 
-                # SSIM (simple approximation - use mean of channel-wise)
+                # SSIM (gaussian-window SSIM)
                 ssim_val = _compute_ssim(pred, gt)
                 seq_ssim.append(ssim_val)
 
@@ -1174,21 +1177,23 @@ def main_worker(rank: int, world_size: int, args):
             )
 
             if is_main_process():
+                # Training per-dataset metrics
                 train_ds_strs = []
                 for name, m in train_metrics.get('datasets', {}).items():
                     train_ds_strs.append(f"train_{name}: PSNR={m['psnr']:.2f}")
 
-                # Print per-dataset metrics
+                # Validation per-dataset metrics (PSNR + SSIM)
                 metric_strs = []
                 for name, m in val_metrics.items():
                     if name != 'avg':
-                        metric_strs.append(f"{name}: PSNR={m['psnr']:.2f}")
+                        metric_strs.append(f"{name}: PSNR={m['psnr']:.2f}/SSIM={m['ssim']:.4f}")
 
                 print(f"Epoch {epoch}: Loss={train_metrics['loss']:.4f}, "
-                      f"PSNR={train_metrics.get('psnr', 0):.2f}, "
-                      f"{', '.join(train_ds_strs)}, "
-                      f"{', '.join(metric_strs)}, "
-                      f"Avg PSNR={val_metrics['avg']['psnr']:.2f}")
+                      f"Train PSNR={train_metrics.get('psnr', 0):.2f}")
+                if train_ds_strs:
+                    print(f"  Train: {', '.join(train_ds_strs)}")
+                print(f"  Val: {', '.join(metric_strs)}")
+                print(f"  Avg: PSNR={val_metrics['avg']['psnr']:.2f}, SSIM={val_metrics['avg']['ssim']:.4f}")
 
                 # Save best model based on average PSNR
                 if val_metrics['avg']['psnr'] > best_avg_psnr:
@@ -1204,11 +1209,12 @@ def main_worker(rank: int, world_size: int, args):
             if is_main_process():
                 train_ds_strs = []
                 for name, m in train_metrics.get('datasets', {}).items():
-                    train_ds_strs.append(f"train_{name}: PSNR={m['psnr']:.2f}")
+                    train_ds_strs.append(f"{name}: PSNR={m['psnr']:.2f}")
 
                 print(f"Epoch {epoch}: Loss={train_metrics['loss']:.4f}, "
-                      f"PSNR={train_metrics.get('psnr', 0):.2f}, "
-                      f"{', '.join(train_ds_strs)}")
+                      f"Train PSNR={train_metrics.get('psnr', 0):.2f}")
+                if train_ds_strs:
+                    print(f"  Train: {', '.join(train_ds_strs)}")
 
         # Save periodic checkpoint
         if is_main_process() and epoch % config.train.save_every == 0:
