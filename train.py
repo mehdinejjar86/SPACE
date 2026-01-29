@@ -584,7 +584,16 @@ def validate(model: SPACE,
         )
 
         # Compute losses (full image mode)
-        losses = criterion(pred_frame, target_frame, compute_all=True)
+        if isinstance(criterion, HybridLoss):
+            losses = criterion(
+                pred_full=pred_frame,
+                target_full=target_frame,
+                model=model,
+                input_frames=input_frames,
+                input_times=input_times,
+            )
+        else:
+            losses = criterion(pred_frame, target_frame, compute_all=True)
         total_loss += losses['total'].item() * B
 
         # Compute PSNR

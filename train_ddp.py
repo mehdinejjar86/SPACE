@@ -842,7 +842,16 @@ def validate_dataset(model, dataloader, criterion, dataset_name: str, rank: int,
         )
 
         # Compute losses
-        losses = criterion(pred_frame, target_frame, compute_all=True)
+        if isinstance(criterion, HybridLoss):
+            losses = criterion(
+                pred_full=pred_frame,
+                target_full=target_frame,
+                model=net,
+                input_frames=input_frames,
+                input_times=input_times,
+            )
+        else:
+            losses = criterion(pred_frame, target_frame, compute_all=True)
         total_loss += losses['total'].item() * B
 
         # PSNR
