@@ -111,6 +111,10 @@ def create_model(config) -> SPACE:
     """Create SPACE model from config."""
     model_config = config.model
 
+    # Hybrid-only: force no fast/refinement paths
+    model_config.use_fast_decoder = False
+    model_config.use_refinement = False
+
     # Use preset if specified
     if model_config.preset:
         return build_space(
@@ -252,9 +256,9 @@ def train_epoch(model: SPACE,
     total_ssim = 0
     num_batches = 0
 
-    training_mode = getattr(config.train, 'training_mode', 'coordinate')
-    use_inr = training_mode in ("coordinate", "hybrid")
-    use_full = training_mode in ("full_image", "hybrid")
+    # Hybrid-only: always use INR + full-frame branches
+    use_inr = True
+    use_full = True
     distill_enabled = getattr(config.train, 'distill_enabled', False)
     distill_weight = float(getattr(config.train, 'distill_weight', 0.0))
     distill_start_epoch = int(getattr(config.train, 'distill_start_epoch', 0))
@@ -286,44 +290,30 @@ def train_epoch(model: SPACE,
             pred_full = None
             pred_rgb = None
 
-            full_mode = None
-            if use_full:
-                full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
+            full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
 
-            if use_inr:
-                coords, target_rgb = sample_coordinates(
-                    target_frame,
-                    config.train.num_samples,
-                    target_time
-                )
-                if use_full:
-                    pred_rgb, pred_full = model(
-                        input_frames, input_times, coords,
-                        target_time=target_time,
-                        return_full=True,
-                        full_mode=full_mode,
-                    )
-                else:
-                    pred_rgb = model(input_frames, input_times, coords)
-                coord_losses = criterion(pred_rgb, target_rgb, compute_all=False)
-                for name, val in coord_losses.items():
-                    losses[f"coord_{name}"] = val
-                total = total + config.train.coordinate_loss_weight * coord_losses['total']
+            coords, target_rgb = sample_coordinates(
+                target_frame,
+                config.train.num_samples,
+                target_time
+            )
+            pred_rgb, pred_full = model(
+                input_frames, input_times, coords,
+                target_time=target_time,
+                return_full=True,
+                full_mode=full_mode,
+            )
+            coord_losses = criterion(pred_rgb, target_rgb, compute_all=False)
+            for name, val in coord_losses.items():
+                losses[f"coord_{name}"] = val
+            total = total + config.train.coordinate_loss_weight * coord_losses['total']
 
-            if use_full and pred_full is None:
-                pred_full = model(
-                    input_frames, input_times, None,
-                    target_time=target_time,
-                    return_full=True,
-                    full_mode=full_mode,
-                )
-                full_losses = criterion(pred_full, target_frame, compute_all=True)
-                for name, val in full_losses.items():
-                    losses[f"full_{name}"] = val
-                total = total + config.train.full_image_loss_weight * full_losses['total']
+            full_losses = criterion(pred_full, target_frame, compute_all=True)
+            for name, val in full_losses.items():
+                losses[f"full_{name}"] = val
+            total = total + config.train.full_image_loss_weight * full_losses['total']
 
-            if (distill_enabled and distill_weight > 0 and use_inr and use_full and
-                    pred_full is not None and pred_rgb is not None and epoch >= distill_start_epoch):
+            if (distill_enabled and distill_weight > 0 and epoch >= distill_start_epoch):
                 naf_rgb = sample_rgb_from_frame(pred_full, coords)
                 diff = naf_rgb - pred_rgb
                 distill = torch.sqrt(diff * diff + config.train.charbonnier_eps ** 2).mean()
@@ -411,9 +401,9 @@ def train_epoch_advanced(model: SPACE,
     total_ssim = 0.0
     num_batches = 0
 
-    training_mode = getattr(config.train, 'training_mode', 'coordinate')
-    use_inr = training_mode in ("coordinate", "hybrid")
-    use_full = training_mode in ("full_image", "hybrid")
+    # Hybrid-only: always use INR + full-frame branches
+    use_inr = True
+    use_full = True
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
@@ -438,50 +428,36 @@ def train_epoch_advanced(model: SPACE,
             pred_full = None
             pred_rgb = None
 
-            full_mode = None
-            if use_full:
-                full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
+            full_mode = 'nafnet' if getattr(model, 'use_nafnet_decoder', False) else 'fast'
 
-            if use_inr:
-                coords, target_rgb = sample_coordinates(
-                    target_frame,
-                    config.train.num_samples,
-                    target_time
-                )
-                if use_full:
-                    pred_rgb, pred_full = model(
-                        input_frames, input_times, coords,
-                        target_time=target_time,
-                        return_full=True,
-                        full_mode=full_mode,
-                    )
-                else:
-                    pred_rgb = model(input_frames, input_times, coords)
-                coord_losses = criterion(
-                    pred_rgb, target_rgb,
-                    model=model,
-                    input_frames=input_frames,
-                    input_times=input_times,
-                    compute_all=False
-                )
-                for name, val in coord_losses.items():
-                    losses[f"coord_{name}"] = val
-                total = total + config.train.coordinate_loss_weight * coord_losses['total']
+            coords, target_rgb = sample_coordinates(
+                target_frame,
+                config.train.num_samples,
+                target_time
+            )
+            pred_rgb, pred_full = model(
+                input_frames, input_times, coords,
+                target_time=target_time,
+                return_full=True,
+                full_mode=full_mode,
+            )
+            coord_losses = criterion(
+                pred_rgb, target_rgb,
+                model=model,
+                input_frames=input_frames,
+                input_times=input_times,
+                compute_all=False
+            )
+            for name, val in coord_losses.items():
+                losses[f"coord_{name}"] = val
+            total = total + config.train.coordinate_loss_weight * coord_losses['total']
 
-            if use_full and pred_full is None:
-                pred_full = model(
-                    input_frames, input_times, None,
-                    target_time=target_time,
-                    return_full=True,
-                    full_mode=full_mode,
-                )
-                full_losses = criterion(pred_full, target_frame, compute_all=True)
-                for name, val in full_losses.items():
-                    losses[f"full_{name}"] = val
-                total = total + config.train.full_image_loss_weight * full_losses['total']
+            full_losses = criterion(pred_full, target_frame, compute_all=True)
+            for name, val in full_losses.items():
+                losses[f"full_{name}"] = val
+            total = total + config.train.full_image_loss_weight * full_losses['total']
 
-            if (distill_enabled and distill_weight > 0 and use_inr and use_full and
-                    pred_full is not None and pred_rgb is not None and epoch >= distill_start_epoch):
+            if (distill_enabled and distill_weight > 0 and epoch >= distill_start_epoch):
                 naf_rgb = sample_rgb_from_frame(pred_full, coords)
                 diff = naf_rgb - pred_rgb
                 distill = torch.sqrt(diff * diff + config.train.charbonnier_eps ** 2).mean()

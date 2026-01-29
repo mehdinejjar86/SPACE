@@ -73,6 +73,10 @@ def set_seed(seed: int, rank: int = 0):
 def create_model(config) -> SPACE:
     """Create SPACE model from config."""
     model_config = config.model
+    # Hybrid-only: force no fast/refinement paths
+    model_config.use_fast_decoder = False
+    model_config.use_refinement = False
+
     if model_config.preset:
         return build_space(
             model_config.preset,
@@ -600,9 +604,9 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not is_main_process())
 
-    training_mode = getattr(config.train, 'training_mode', 'hybrid')
-    use_inr = training_mode in ("coordinate", "hybrid")
-    use_full = training_mode in ("full_image", "hybrid")
+    # Hybrid-only: always use INR + full-frame branches
+    use_inr = True
+    use_full = True
     distill_enabled = getattr(config.train, 'distill_enabled', False)
     distill_weight = float(getattr(config.train, 'distill_weight', 0.0))
     distill_start_epoch = int(getattr(config.train, 'distill_start_epoch', 0))
@@ -675,55 +679,44 @@ def train_epoch(model, dataloader, optimizer, scaler, criterion, config, epoch, 
                 )
                 total_loss = losses['total']
 
-            # Standard training: coordinate-based or full-frame
+            # Standard hybrid training (always both branches)
             else:
-                if use_full:
-                    full_mode = 'nafnet' if getattr(net, 'use_nafnet_decoder', False) else 'fast'
+                full_mode = 'nafnet' if getattr(net, 'use_nafnet_decoder', False) else 'fast'
 
-                if use_inr:
-                    coords, target_rgb = sample_coordinates(
-                        target_frame, config.train.num_samples, target_time
+                coords, target_rgb = sample_coordinates(
+                    target_frame, config.train.num_samples, target_time
+                )
+                pred_rgb, pred_full = model(
+                    input_frames, input_times, coords,
+                    target_time=target_time,
+                    return_full=True,
+                    full_mode=full_mode,
+                )
+
+                # Coordinate loss
+                if hasattr(criterion, 'uncertainty'):
+                    coord_losses = criterion(
+                        pred_rgb, target_rgb,
+                        model=model,
+                        input_frames=input_frames,
+                        input_times=input_times,
+                        compute_all=False
                     )
-                    if use_full:
-                        pred_rgb, pred_full = model(
-                            input_frames, input_times, coords,
-                            target_time=target_time,
-                            return_full=True,
-                            full_mode=full_mode,
-                        )
-                    else:
-                        pred_rgb = model(input_frames, input_times, coords)
+                else:
+                    coord_losses = criterion(pred_rgb, target_rgb, compute_all=False)
 
-                    # Compute coordinate loss
-                    if hasattr(criterion, 'uncertainty'):
-                        coord_losses = criterion(
-                            pred_rgb, target_rgb,
-                            model=model,
-                            input_frames=input_frames,
-                            input_times=input_times,
-                            compute_all=False
-                        )
-                    else:
-                        coord_losses = criterion(pred_rgb, target_rgb, compute_all=False)
+                for name, val in coord_losses.items():
+                    losses[f"coord_{name}"] = val
+                total_loss = total_loss + config.train.coordinate_loss_weight * coord_losses['total']
 
-                    for name, val in coord_losses.items():
-                        losses[f"coord_{name}"] = val
-                    total_loss = total_loss + config.train.coordinate_loss_weight * coord_losses['total']
+                # Full-frame losses
+                full_losses = criterion(pred_full, target_frame, compute_all=True)
+                for name, val in full_losses.items():
+                    losses[f"full_{name}"] = val
+                total_loss = total_loss + config.train.full_image_loss_weight * full_losses['total']
 
-                if use_full and pred_full is None:
-                    pred_full = model(
-                        input_frames, input_times, None,
-                        target_time=target_time,
-                        return_full=True,
-                        full_mode=full_mode,
-                    )
-                    full_losses = criterion(pred_full, target_frame, compute_all=True)
-                    for name, val in full_losses.items():
-                        losses[f"full_{name}"] = val
-                    total_loss = total_loss + config.train.full_image_loss_weight * full_losses['total']
-
-                if (distill_enabled and distill_weight > 0 and use_inr and use_full and
-                        pred_full is not None and pred_rgb is not None and epoch >= distill_start_epoch):
+                # Distillation (optional)
+                if (distill_enabled and distill_weight > 0 and epoch >= distill_start_epoch):
                     naf_rgb = sample_rgb_from_frame(pred_full, coords)
                     diff = naf_rgb - pred_rgb
                     distill = torch.sqrt(diff * diff + config.train.charbonnier_eps ** 2).mean()
@@ -1281,6 +1274,11 @@ def main_worker(rank: int, world_size: int, args):
                 f"x4k_steps ({len(config.data.x4k_steps)})"
             )
 
+    # Hybrid-only: force settings regardless of config file/CLI
+    config.train.training_mode = "hybrid"
+    config.model.use_fast_decoder = False
+    config.model.use_refinement = False
+
     # Optimization options
     if getattr(args, 'compile', False):
         config.train.use_compile = True
@@ -1337,19 +1335,12 @@ def main_worker(rank: int, world_size: int, args):
             print("  Model compiled successfully")
 
     if world_size > 1:
-        training_mode = getattr(config.train, 'training_mode', 'hybrid')
-        use_inr = training_mode in ("coordinate", "hybrid")
-        use_full = training_mode in ("full_image", "hybrid")
         uses_hybrid = getattr(config.model, 'use_hybrid_decoder', True)
-        uses_nafnet = use_full and config.model.use_nafnet_decoder and not uses_hybrid
-        uses_fast = use_full and (not config.model.use_nafnet_decoder) and config.model.use_fast_decoder and not uses_hybrid
+        uses_nafnet = config.model.use_nafnet_decoder and not uses_hybrid
+        uses_fast = (not config.model.use_nafnet_decoder) and config.model.use_fast_decoder and not uses_hybrid
         # Any optional decoder that isn't exercised this run will be unused.
         # With hybrid decoder, both NAFNet and SIREN guidance are used
-        find_unused = (
-            (not use_inr and not uses_hybrid) or
-            (config.model.use_fast_decoder and not uses_fast) or
-            (config.model.use_nafnet_decoder and not uses_nafnet and not uses_hybrid)
-        )
+        find_unused = True
         model = DDP(model, device_ids=[rank], find_unused_parameters=find_unused)
 
     if is_main_process():
